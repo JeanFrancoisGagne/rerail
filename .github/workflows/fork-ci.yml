@@ -1,0 +1,1346 @@
+# Runs the checks of .github/workflows/ci.yml that need no repository secret, on GitHub's own runners, for one
+# commit of this repository, and the same checks at a commit of main, so each failure is read against main's on the
+# same runner images. It is started by hand (workflow_dispatch) and only reads: it writes to no repository, opens no
+# issue and posts no comment. Each job uploads its results as an artifact named fork-ci--<check>--<side>, side head
+# or base: leg.json (each step's outcome) and the test reports (vitest's JSON report, Playwright's JSON report,
+# cargo's output).
+#
+# Inputs: `ref`, a branch or commit of this repository; `base`, the full id of the commit of main it is compared with;
+# `files`, test files under test/, integration/ or e2e/ for a narrow run (commas or spaces between them), or empty for
+# every job whole.
+#
+# What differs from ci.yml, and why:
+# - The pack test data is not here. The rule packs' test data reaches ci.yml from S3 under the repository's OIDC role,
+#   which this repository cannot assume, so tests that read it fail at both commits ("pack test data is not in git")
+#   and read as failing on main too. The jobs that only fetch or score that data (test-data, test-data-in-s3,
+#   conformance and the tools job's conformance step) do not run.
+# - Jobs that need a secret do not run: installed-packs (an npm token), real-sessions and provider-smoke (model
+#   providers' keys), conformance-report (posts a comment).
+# - Every job runs whole, as ci.yml runs on a push to main: the changes job's path filters are not applied. A job a pull
+#   request would skip still runs here, and its failures are read against main's the same way.
+# - The release engine is built once per engine tree and operating system (the plan job's id of native/, languages/,
+#   the Cargo files, the pinned toolchain and the napi CLI's version) and kept in the Actions cache under that id;
+#   every job that needs it restores it. ci.yml builds it in the build job and, on a miss, in each Windows shard.
+# - The engine's Windows-only Rust tests, which ci.yml runs in a Windows shard when the engine's cache misses, run in
+#   a job of their own, at both commits, when the commit's engine tree differs from main's.
+# - The Rust test legs add --no-fail-fast, so a failing test binary does not hide the binaries after it.
+# - Check steps after a failed check step of the same job still run, so each check reports.
+#
+# Main's results are kept: once every check at `base` has given a result, the keep job saves them in the Actions cache
+# under the base commit, the files of a narrow run and this workflow's commit, and a later run against the same base
+# restores them (the kept job) instead of running main's side again.
+
+name: CI at a chosen commit
+
+run-name: ${{ inputs.ref }} against ${{ inputs.base }}${{ inputs.files != '' && ', narrow' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: A branch or commit of this repository to check
+        required: true
+        type: string
+      base:
+        description: The full id of the commit of main to compare with
+        required: true
+        type: string
+      files:
+        description: Test files for a narrow run (under test/, integration/ or e2e/), or empty for every job whole
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+# One run per ref: a newer run of the same ref cancels the older one.
+concurrency:
+  group: fork-ci-${{ inputs.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Writes $RUNNER_TEMP/fork-ci/leg.json, the record of one job: which check (LEG), for which sides (SIDES, joined
+  # by + or commas), at which commit, each step's outcome (STEPS, the steps context), and EXTRA. Steps whose id is check or
+  # starts with check- are the checks; the others set the job up.
+  FORK_CI_RECORD: |
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const out = path.join(process.env.RUNNER_TEMP, "fork-ci");
+    fs.mkdirSync(out, { recursive: true });
+    const steps = JSON.parse(process.env.STEPS || "{}");
+    const leg = {
+      leg: process.env.LEG,
+      sides: (process.env.SIDES || "").split(/[+,]/).filter(Boolean),
+      sha: process.env.SHA,
+      os: process.env.RUNNER_OS,
+      root: process.env.GITHUB_WORKSPACE,
+      run: process.env.GITHUB_RUN_ID,
+      attempt: process.env.GITHUB_RUN_ATTEMPT,
+      steps: Object.fromEntries(Object.entries(steps).map(([id, step]) => [id, step.outcome])),
+      extra: JSON.parse(process.env.EXTRA || "{}"),
+    };
+    fs.writeFileSync(path.join(out, "leg.json"), JSON.stringify(leg, null, 1) + "\n");
+
+jobs:
+  # Resolves `ref` and `base` to commits, checks the narrow run's files, and plans every job below as matrices of
+  # sides: {name: head or base, sha, engine: the engine tree's id, unit, integration, e2e: a narrow run's files at that
+  # commit}. When the head is main's commit itself only the base side runs.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      head: ${{ steps.commits.outputs.head }}
+      base: ${{ steps.commits.outputs.base }}
+      whole: ${{ steps.commits.outputs.whole }}
+      kept: ${{ steps.kept.outputs.cache-hit == 'true' }}
+      kept-key: ${{ steps.commits.outputs.kept-key }}
+      engines: ${{ steps.jobs.outputs.engines }}
+      build: ${{ steps.jobs.outputs.build }}
+      lint: ${{ steps.jobs.outputs.lint }}
+      licenses: ${{ steps.jobs.outputs.licenses }}
+      audit: ${{ steps.jobs.outputs.audit }}
+      tools: ${{ steps.jobs.outputs.tools }}
+      rust: ${{ steps.jobs.outputs.rust }}
+      rust-macos: ${{ steps.jobs.outputs.rust-macos }}
+      rust-windows: ${{ steps.jobs.outputs.rust-windows }}
+      unit: ${{ steps.jobs.outputs.unit }}
+      unit-shards: ${{ steps.jobs.outputs.unit-shards }}
+      unit-total: ${{ steps.jobs.outputs.unit-total }}
+      windows: ${{ steps.jobs.outputs.windows }}
+      windows-shards: ${{ steps.jobs.outputs.windows-shards }}
+      windows-total: ${{ steps.jobs.outputs.windows-total }}
+      integration: ${{ steps.jobs.outputs.integration }}
+      e2e: ${{ steps.jobs.outputs.e2e }}
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The repository is public, so the base commit is fetched without credentials.
+      - id: commits
+        name: Resolve the commits and plan the jobs
+        env:
+          BASE: ${{ inputs.base }}
+          FILES: ${{ inputs.files }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PLAN'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+
+          # What the release engine is built from (ci.yml's native cache key reads the same files).
+          ENGINE_INPUTS = ("native", "languages", "Cargo.lock", "Cargo.toml", "rust-toolchain.toml")
+          HOOK_TEST = "integration/claude-hook-rules.test.ts"
+          UNIT_SHARDS, WINDOWS_SHARDS = [1, 2], [1, 2, 3, 4, 5]
+
+
+          def fail(message):
+              print(f"::error::{message}")
+              sys.exit(1)
+
+
+          def git(*args):
+              done = subprocess.run(["git", *args], capture_output=True, text=True)
+              if done.returncode != 0:
+                  fail(f"git {' '.join(args)} failed: {done.stderr.strip()[:300]}")
+              return done.stdout.strip()
+
+
+          def exists(sha, path):
+              return subprocess.run(["git", "cat-file", "-e", f"{sha}:{path}"], capture_output=True).returncode == 0
+
+
+          def engine_id(sha):
+              parts = [f"{p} {git('rev-parse', f'{sha}:{p}')}" for p in ENGINE_INPUTS]
+              napi = json.loads(git("show", f"{sha}:package.json"))["devDependencies"]["@napi-rs/cli"]
+              return hashlib.sha256("\n".join(parts + [f"napi {napi}"]).encode()).hexdigest()[:20]
+
+
+          head, base = git("rev-parse", "HEAD"), os.environ["BASE"].strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", base):
+              fail(f"base must be the full id of a commit of main (40 lower-case hexadecimal characters), not '{base}'")
+          if base != head and subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", base]).returncode != 0:
+              fail(f"this repository cannot serve the base commit {base}: push a branch that holds it here first")
+
+          files = sorted({f for f in re.split(r"[\s,]+", os.environ.get("FILES", "")) if f})
+          bad = [f for f in files if not re.fullmatch(r"(test|integration|e2e)/[A-Za-z0-9._/@+-]+", f) or ".." in f.split("/")]
+          if bad:
+              fail(f"not a test file under test/, integration/ or e2e/: {', '.join(bad)}")
+          missing = [f for f in files if not exists(head, f)]
+          if missing:
+              fail(f"not in {head[:12]}: {', '.join(missing)}")
+          whole = not files
+
+          names = ["base"] if head == base else ["head", "base"]
+          commit = {"head": head, "base": base}
+          sides = []
+          for name in names:
+              at = [f for f in files if exists(commit[name], f)]
+              sides.append({"name": name, "sha": commit[name], "engine": engine_id(commit[name]),
+                            "unit": " ".join(f for f in at if f.startswith("test/")),
+                            "integration": " ".join(f for f in at if f.startswith("integration/")),
+                            "e2e": " ".join(f for f in at if f.startswith("e2e/"))})
+
+
+          def having(*kinds):
+              """Every side in a whole run; in a narrow run, the sides holding a file of one of these kinds."""
+              return list(sides) if whole else [s for s in sides if any(s[k] for k in kinds)]
+
+
+          def windows_side(s):
+              return whole or bool(s["unit"]) or HOOK_TEST in s["integration"].split()
+
+
+          engines_differ = len({s["engine"] for s in sides}) > 1
+          matrices = {
+              "build": having("unit", "integration", "e2e"),
+              "lint": having() if whole else [], "licenses": having() if whole else [],
+              "audit": having() if whole else [], "tools": having() if whole else [],
+              "rust": having() if whole else [], "rust-macos": having() if whole else [],
+              "rust-windows": list(sides) if whole and engines_differ else [],
+              "unit": having("unit"), "windows": [s for s in sides if windows_side(s)],
+              "integration": having("integration"), "e2e": having("e2e"),
+          }
+          unit_shards, windows_shards = (UNIT_SHARDS, WINDOWS_SHARDS) if whole else ([1], [1])
+          legs = {name: [] for name in names}
+
+
+          def expect(kind, *ids):
+              for s in matrices[kind]:
+                  legs[s["name"]].extend(ids)
+
+
+          expect("build", "engine-linux", "build")
+          for kind in ("lint", "licenses", "audit", "tools", "rust-macos", "rust-windows", "integration"):
+              expect(kind, kind)
+          expect("e2e", "ui-e2e")
+          expect("rust", "rust-clippy", "rust-test-a", "rust-test-b")
+          expect("unit", *[f"unit-{k}" for k in unit_shards])
+          expect("windows", "engine-windows", *[f"unit-windows-{k}" for k in windows_shards])
+
+          scope = "whole" if whole else "files-" + hashlib.sha256("\n".join(files).encode()).hexdigest()[:16]
+          plan = {"head": head, "base": base, "whole": whole, "files": files, "scope": scope,
+                  "kept_key": f"fork-ci-base-{base}-{scope}-{os.environ['WORKFLOW_SHA'][:12]}",
+                  "sides": names, "matrices": matrices, "unit_shards": unit_shards,
+                  "windows_shards": windows_shards, "legs": legs}
+          out = os.path.join(os.environ["RUNNER_TEMP"], "fork-ci")
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, "plan.json"), "w", encoding="utf-8") as handle:
+              json.dump(plan, handle, indent=1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"head={head}\nbase={base}\nwhole={'true' if whole else 'false'}\nkept-key={plan['kept_key']}\n")
+          print(f"head {head}, base {base}, {'whole' if whole else 'narrow: ' + ' '.join(files)}; engines differ: {engines_differ}")
+          PLAN
+
+      # Main's results from an earlier run against the same base, files and workflow, when one kept them.
+      - id: kept
+        name: Look up main's kept results
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fork-ci-kept
+          key: ${{ steps.commits.outputs.kept-key }}
+          lookup-only: true
+
+      # With main's results kept, main's side runs only where they cannot stand in: the Windows Rust tests, which run
+      # at both commits only when the engine trees differ. Each engine is built once per tree and OS for the sides
+      # that need it.
+      - id: jobs
+        name: Write the job matrices
+        env:
+          KEPT: ${{ steps.kept.outputs.cache-hit == 'true' }}
+        run: |
+          python3 - <<'JOBS'
+          import json
+          import os
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "fork-ci", "plan.json")
+          with open(path, encoding="utf-8") as handle:
+              plan = json.load(handle)
+          plan["kept"] = os.environ["KEPT"] == "true"
+          matrices = plan["matrices"]
+          if plan["kept"]:
+              for kind in matrices:
+                  if kind != "rust-windows":
+                      matrices[kind] = [s for s in matrices[kind] if s["name"] != "base"]
+          engines = []
+          for kind, runner, label in (("build", "ubuntu-24.04", "linux"), ("windows", "windows-2025", "windows")):
+              trees = {}
+              for side in matrices[kind]:
+                  entry = trees.setdefault(side["engine"], {"os": runner, "label": label, "tree": side["engine"],
+                                                            "sha": side["sha"], "sides": []})
+                  entry["sides"].append(side["name"])
+              engines.extend(trees.values())
+          for entry in engines:
+              entry["sides"] = "+".join(entry["sides"])
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(plan, handle, indent=1)
+          lines = {kind: json.dumps(sides, separators=(",", ":")) for kind, sides in matrices.items()}
+          lines.update({"engines": json.dumps(engines, separators=(",", ":")),
+                        "unit-shards": json.dumps(plan["unit_shards"]), "unit-total": str(len(plan["unit_shards"])),
+                        "windows-shards": json.dumps(plan["windows_shards"]),
+                        "windows-total": str(len(plan["windows_shards"]))})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write("".join(f"{key}={value}\n" for key, value in lines.items()))
+          print(f"main's results kept: {plan['kept']}; engines to build or restore: {len(engines)}")
+          JOBS
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--plan
+          path: ${{ runner.temp }}/fork-ci/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  # The release engine, once per engine tree and OS: restored from the cache when an earlier run built it, else built
+  # as ci.yml's build job builds it and saved at once.
+  engine:
+    name: Engine (${{ matrix.label }}, ${{ matrix.sides }})
+    needs: plan
+    if: needs.plan.outputs.engines != '[]'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.engines) }}
+    steps:
+      - id: longpaths
+        name: Allow long paths in Git on Windows
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
+
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: cached
+        name: Look up the engine
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tree }}
+          lookup-only: true
+
+      - id: lfs
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: ./.github/actions/lfs
+
+      - id: rust-toolchain
+        name: Read pinned Rust toolchain
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - id: rust-install
+        name: Install pinned Rust toolchain
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+      # ci.yml's build job keeps this cache on Linux; its Windows shards keep none.
+      - id: cargo-cache
+        name: Cache cargo artifacts
+        if: steps.cached.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rerail-release-${{ runner.os }}-${{ steps.rust-toolchain.outputs.channel }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rerail-release-${{ runner.os }}-${{ steps.rust-toolchain.outputs.channel }}-
+
+      - id: deps
+        if: steps.cached.outputs.cache-hit != 'true'
+        uses: ./.github/actions/node-deps
+
+      - id: check-engine
+        name: Build the native engine
+        if: steps.cached.outputs.cache-hit != 'true'
+        run: npm run build:native
+
+      - id: save
+        name: Save the engine
+        if: steps.cached.outputs.cache-hit != 'true' && steps.check-engine.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tree }}
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: engine-${{ matrix.label }}
+          SIDES: ${{ matrix.sides }}
+          SHA: ${{ matrix.sha }}
+          STEPS: ${{ toJSON(steps) }}
+          EXTRA: '{"tree": "${{ matrix.tree }}", "cache_hit": ${{ steps.cached.outputs.cache-hit == ''true'' }} }'
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--engine-${{ matrix.label }}--${{ matrix.sides }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's build job: dist/ with the Linux engine, handed to the test jobs of the same side.
+  build:
+    name: Build (${{ matrix.side.name }})
+    needs: [plan, engine]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.build != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.build) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: engine
+        name: Restore the native engine
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
+          fail-on-cache-miss: true
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: check-build
+        name: Build the package
+        run: npm run build:js
+
+      - id: upload
+        name: Upload the built package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: built-${{ matrix.side.name }}
+          path: |
+            dist/
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: build
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--build--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's lint job. Core's release notes are checked on the head side against the base commit, as ci.yml checks a
+  # pull request against its base branch's tip.
+  lint:
+    name: Lint and type-check (${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.lint != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.lint) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: just
+        name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.57.0"
+
+      - id: check-justfile
+        name: Check the Justfile
+        run: just --fmt --check --unstable
+
+      - id: deps
+        if: ${{ !cancelled() && steps.just.outcome == 'success' }}
+        uses: ./.github/actions/node-deps
+
+      - id: fetch-base
+        name: Fetch the base commit
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' && matrix.side.name == 'head' }}
+        env:
+          BASE: ${{ needs.plan.outputs.base }}
+        run: git fetch --no-tags --depth=1 origin "$BASE"
+
+      - id: check-changelog
+        name: Check core's release notes
+        if: ${{ !cancelled() && steps.fetch-base.outcome == 'success' }}
+        env:
+          BASE: ${{ needs.plan.outputs.base }}
+        run: node scripts/release/core-changelog-check.mjs "$BASE"
+
+      - id: check-types
+        name: Type-check, structure gate, and generated references
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          npm run check
+          npm run check:ui-tokens
+          npm run check:reference
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: lint
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--lint--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's licenses job.
+  licenses:
+    name: Licences (${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.licenses != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.licenses) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: uv
+        name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - id: check-reuse
+        name: REUSE lint
+        run: uvx --from 'reuse[charset-normalizer]==6.2.0' reuse lint
+
+      - id: check-allowlist
+        name: Licence allowlist and copyleft gate
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: node scripts/check/check-licenses.mjs
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: licenses
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--licenses--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's audit job. Its advisories come from live databases, so a new advisory fails both sides.
+  audit:
+    name: Dependency audit (${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.audit != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.audit) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: node
+        name: Set up Node.js v24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - id: check-npm-audit
+        name: npm audit (root package, production dependencies)
+        run: npm audit --omit=dev --audit-level=moderate
+
+      - id: cargo-audit
+        name: Install cargo-audit
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-audit
+
+      - id: check-cargo-audit
+        name: cargo audit (engine crates)
+        if: ${{ !cancelled() && steps.cargo-audit.outcome == 'success' }}
+        run: cargo-audit audit --file Cargo.lock
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: audit
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--audit--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's rust job, three legs per side. The test legs' three tool-packs' test data is not here.
+  rust:
+    name: Rust engine (${{ matrix.leg.name }}, ${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.rust != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.rust) }}
+        leg:
+          - id: rust-clippy
+            task: clippy
+            name: fmt, clippy
+            run: npm run check:native
+          - id: rust-test-a
+            task: test
+            name: tests, workspace and anchors
+            run: "npm run test:native -- --no-fail-fast -- code_rule_dsl::workspace:: code_rule_dsl::matcher::anchors::"
+          - id: rust-test-b
+            task: test
+            name: tests, the rest
+            run: "npm run test:native -- --no-fail-fast -- --skip code_rule_dsl::workspace:: --skip code_rule_dsl::matcher::anchors::"
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: rust-toolchain
+        name: Read pinned Rust toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - id: rust-install
+        name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - id: cargo-cache
+        name: Cache cargo artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rerail-${{ matrix.leg.task }}-${{ runner.os }}-${{ steps.rust-toolchain.outputs.channel }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rerail-${{ matrix.leg.task }}-${{ runner.os }}-${{ steps.rust-toolchain.outputs.channel }}-
+
+      - id: check
+        name: Run ${{ matrix.leg.name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/fork-ci"
+          ${{ matrix.leg.run }} 2>&1 | tee "$RUNNER_TEMP/fork-ci/check.cargo.log"
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: ${{ matrix.leg.id }}
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--${{ matrix.leg.id }}--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's rust-macos job: the tree watch's FSEvents adapter and shared tests. They read no pack test data.
+  rust-macos:
+    name: Rust engine (macOS tree watch, ${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.rust-macos != '[]'
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.rust-macos) }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: rust-toolchain
+        name: Read pinned Rust toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - id: rust-install
+        name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+      - id: cargo-cache
+        name: Cache cargo artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rerail-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-toolchain.outputs.channel }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rerail-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust-toolchain.outputs.channel }}-
+
+      - id: check
+        name: Tree watch tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/fork-ci"
+          cargo test --manifest-path native/Cargo.toml --lib tree_watch:: 2>&1 | tee "$RUNNER_TEMP/fork-ci/check.cargo.log"
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: rust-macos
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--rust-macos--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # The engine's #[cfg(windows)] tests, which ci.yml runs in its Windows shard 2 when the engine's cache misses. Here
+  # they run when the engine tree differs from main's, at both commits. A debug build, as in ci.yml.
+  rust-windows:
+    name: Rust engine (Windows tests, ${{ matrix.side.name }})
+    needs: plan
+    if: needs.plan.outputs.rust-windows != '[]'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.rust-windows) }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - id: longpaths
+        name: Allow long paths in Git on Windows
+        run: git config --system core.longpaths true
+
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: rust-toolchain
+        name: Read pinned Rust toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - id: rust-install
+        name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+      - id: check
+        name: Engine Windows tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/fork-ci"
+          cargo test --manifest-path native/Cargo.toml --lib -- process:: code_rule_dsl::import_target:: tree_watch:: 2>&1 | tee "$RUNNER_TEMP/fork-ci/check.cargo.log"
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: rust-windows
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--rust-windows--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's unit job, both shards (one in a narrow run), with its lint config coverage gate on the first shard.
+  unit:
+    name: Unit tests (${{ matrix.shard }}/${{ needs.plan.outputs.unit-total }}, ${{ matrix.side.name }})
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.unit != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.unit) }}
+        shard: ${{ fromJSON(needs.plan.outputs.unit-shards) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: built
+        name: Download the built package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: built-${{ matrix.side.name }}
+
+      # FILES: a narrow run's test files at this commit, one word each, as the plan checked them; empty runs the shard.
+      - id: check-tests
+        name: Unit tests
+        env:
+          RERAIL_PACK_FIXTURES_IN_CONFORMANCE: "1"
+          SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.unit-total }}
+          FILES: ${{ matrix.side.unit }}
+        run: |
+          # shellcheck disable=SC2086
+          npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+
+      - id: check-coverage
+        name: Lint config coverage gate
+        if: ${{ !cancelled() && steps.built.outcome == 'success' && matrix.shard == 1 && needs.plan.outputs.whole == 'true' }}
+        run: npm run test:coverage:lint-config
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: unit-${{ matrix.shard }}
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--unit-${{ matrix.shard }}--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's unit-windows job, five shards (one in a narrow run), with the Claude Code hook integration test on the
+  # first. The Windows engine comes from the engine job's cache entry for this commit's engine tree.
+  unit-windows:
+    name: Unit tests (Windows, ${{ matrix.shard }}/${{ needs.plan.outputs.windows-total }}, ${{ matrix.side.name }})
+    needs: [plan, engine]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.windows != '[]' }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.windows) }}
+        shard: ${{ fromJSON(needs.plan.outputs.windows-shards) }}
+    steps:
+      - id: longpaths
+        name: Allow long paths in Git on Windows
+        run: git config --system core.longpaths true
+
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: engine
+        name: Restore the native engine
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
+          fail-on-cache-miss: true
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: check-build
+        name: Build the package
+        run: npm run build:js
+
+      # TEMP and TMP at runner.temp, a long path, as in ci.yml: the runner's own TEMP is an 8.3 short path.
+      - id: check-tests
+        name: Unit tests
+        if: ${{ !cancelled() && steps.check-build.outcome == 'success' && (needs.plan.outputs.whole == 'true' || matrix.side.unit != '') }}
+        env:
+          RERAIL_PACK_FIXTURES_IN_CONFORMANCE: "1"
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.windows-total }}
+          FILES: ${{ matrix.side.unit }}
+        run: |
+          # shellcheck disable=SC2086
+          npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+
+      - id: check-hook
+        name: Claude Code hook integration test
+        if: ${{ !cancelled() && steps.check-build.outcome == 'success' && matrix.shard == 1 && (needs.plan.outputs.whole == 'true' || contains(format(' {0} ', matrix.side.integration), ' integration/claude-hook-rules.test.ts ')) }}
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: npx vitest run integration/claude-hook-rules.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-hook.vitest.json"
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: unit-windows-${{ matrix.shard }}
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--unit-windows-${{ matrix.shard }}--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's ui-e2e job. A JSON report is added to the list reporter for reading; the HTML report it replaces is not
+  # read, and the Playwright results and traces are uploaded on failure, as ci.yml uploads them.
+  ui-e2e:
+    name: Dashboard browser tests (${{ matrix.side.name }})
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.e2e != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.e2e) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: built
+        name: Download the built package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: built-${{ matrix.side.name }}
+
+      - id: browser
+        name: Install Chromium and its system dependencies
+        run: npx playwright install --with-deps chromium
+
+      - id: check-tests
+        name: Dashboard browser tests
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/fork-ci/check-tests.playwright.json
+          FILES: ${{ matrix.side.e2e }}
+        run: |
+          # shellcheck disable=SC2086
+          npm run test:ui:e2e -- --reporter=list,json $FILES
+
+      - name: Upload the Playwright results and traces
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-e2e-report-${{ matrix.side.name }}
+          path: .rerail/e2e/
+          retention-days: 7
+          overwrite: true
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: ui-e2e
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--ui-e2e--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's integration job.
+  integration:
+    name: Integration tests (${{ matrix.side.name }})
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.integration != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.integration) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: built
+        name: Download the built package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: built-${{ matrix.side.name }}
+
+      - id: omp
+        name: Provision pinned standalone OMP host
+        run: |
+          host="$(node scripts/host/install-omp-host.mjs)"
+          printf 'RERAIL_OMP_EXECUTABLE=%s\n' "$host" >> "$GITHUB_ENV"
+
+      - id: check-tests
+        name: Integration tests
+        env:
+          FILES: ${{ matrix.side.integration }}
+        run: |
+          # shellcheck disable=SC2086
+          npm run test:integration:built -- $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: integration
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--integration--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # ci.yml's tools job without its conformance steps: the script tests and the reference examples, each its own step.
+  tools:
+    name: Scripts and reference examples (${{ matrix.side.name }})
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.tools != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ fromJSON(needs.plan.outputs.tools) }}
+    steps:
+      - id: checkout
+        name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: lfs
+        uses: ./.github/actions/lfs
+
+      - id: deps
+        uses: ./.github/actions/node-deps
+
+      - id: built
+        name: Download the built package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: built-${{ matrix.side.name }}
+
+      - id: check-scripts
+        name: Script tests
+        run: npm run test:scripts
+
+      - id: check-reference
+        name: Reference examples
+        if: ${{ !cancelled() && steps.built.outcome == 'success' }}
+        run: npm run test:reference
+
+      - name: Record the result
+        if: always()
+        env:
+          LEG: tools
+          SIDES: ${{ matrix.side.name }}
+          SHA: ${{ matrix.side.sha }}
+          STEPS: ${{ toJSON(steps) }}
+        run: node -e "$FORK_CI_RECORD"
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci--tools--${{ matrix.side.name }}
+          path: ${{ runner.temp }}/fork-ci/
+          retention-days: 14
+          overwrite: true
+
+  # Saves main's side in the cache under the plan's key, once every check there gave a result: a check whose set-up
+  # failed or that was cancelled gave none, and then nothing is kept. The Windows Rust tests are never kept: they run
+  # at main only beside a head whose engine tree differs.
+  keep:
+    name: Keep main's results
+    needs: [plan, engine, build, lint, licenses, audit, rust, rust-macos, rust-windows, unit, unit-windows, ui-e2e, integration, tools]
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.kept != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download the results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fork-ci--*
+          path: fork-ci-all
+
+      - id: gather
+        name: Gather main's results
+        run: |
+          python3 - <<'KEEP'
+          import json
+          import os
+          import shutil
+
+          ALL, KEPT = "fork-ci-all", "fork-ci-kept"
+
+
+          def is_check(step):
+              return step == "check" or step.startswith("check-")
+
+
+          def complete(leg):
+              """A check gave a result: nothing was cancelled, no set-up step failed, and a check step ran (or the
+              engine came from the cache)."""
+              steps = leg.get("steps", {})
+              if "cancelled" in steps.values():
+                  return False
+              if any(outcome == "failure" for step, outcome in steps.items() if not is_check(step)):
+                  return False
+              ran = any(outcome in ("success", "failure") for step, outcome in steps.items() if is_check(step))
+              return ran or leg.get("extra", {}).get("cache_hit") is True
+
+
+          with open(os.path.join(ALL, "fork-ci--plan", "plan.json"), encoding="utf-8") as handle:
+              plan = json.load(handle)
+          found = {}
+          for folder in sorted(os.listdir(ALL)):
+              path = os.path.join(ALL, folder, "leg.json")
+              if os.path.isfile(path):
+                  with open(path, encoding="utf-8") as handle:
+                      leg = json.load(handle)
+                  if "base" in leg.get("sides", []) and leg.get("leg") != "rust-windows":
+                      found[leg["leg"]] = (folder, leg)
+          want = [name for name in plan["legs"].get("base", []) if name != "rust-windows"]
+          lacking = [name for name in want if name not in found or not complete(found[name][1])]
+          if lacking:
+              print(f"main's results are not kept: no result from {', '.join(lacking)}")
+          else:
+              for name in want:
+                  folder, leg = found[name]
+                  target = os.path.join(KEPT, f"fork-ci--{name}--base")
+                  shutil.copytree(os.path.join(ALL, folder), target)
+                  leg["sides"] = ["base"]
+                  with open(os.path.join(target, "leg.json"), "w", encoding="utf-8") as handle:
+                      json.dump(leg, handle, indent=1)
+              print(f"keeping main's results of {len(want)} checks under {plan['kept_key']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"complete={'false' if lacking else 'true'}\n")
+          KEEP
+
+      - name: Save main's results
+        if: steps.gather.outputs.complete == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fork-ci-kept
+          key: ${{ needs.plan.outputs.kept-key }}
+
+  # Main's results an earlier run kept, uploaded as this run's.
+  kept:
+    name: Main's kept results
+    needs: plan
+    if: needs.plan.outputs.kept == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Restore main's results
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fork-ci-kept
+          key: ${{ needs.plan.outputs.kept-key }}
+          fail-on-cache-miss: true
+
+      - name: Upload main's results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci-kept--base
+          path: fork-ci-kept/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
