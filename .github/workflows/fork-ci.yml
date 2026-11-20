@@ -24,6 +24,8 @@
 # - The engine's Windows-only Rust tests, which ci.yml runs in a Windows shard when the engine's cache misses, run in
 #   a job of their own, at both commits, when the commit's engine tree differs from main's.
 # - The Rust test legs add --no-fail-fast, so a failing test binary does not hide the binaries after it.
+# - A Rust leg builds its test binaries and runs them in one job, where ci.yml has a job for each (rust-tests-build,
+#   then rust): its time limit is the sum of theirs.
 # - Check steps after a failed check step of the same job still run, so each check reports.
 #
 # Main's results are kept: once every check at `base` has given a result, the keep job saves them in the Actions cache
@@ -677,7 +679,9 @@ jobs:
     needs: plan
     if: needs.plan.outputs.rust != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # ci.yml builds the test binaries in one job (30 minutes) and runs each leg from them in another (20): a leg here
+    # does both, so it gets their sum. At 30 the longest leg ran 27 to 30 minutes and one side of it was cut off.
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
