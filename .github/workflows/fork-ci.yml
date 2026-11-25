@@ -7,7 +7,9 @@
 #
 # Inputs: `ref`, a branch or commit of this repository; `base`, the full id of the commit of main it is compared with;
 # `files`, test files under test/, integration/ or e2e/ for a narrow run (commas or spaces between them), or empty for
-# every job whole.
+# every job whole; `rounds`, how many times a narrow run's unit test files run, one after the other, in each unit
+# job (1 unless given): every round runs and keeps a report of its own, and the job fails when any round failed. It
+# shows whether a test file fails by chance on these runners.
 #
 # What differs from ci.yml, and why:
 # - The pack test data is not here. The rule packs' test data reaches ci.yml from S3 under the repository's OIDC role,
@@ -51,6 +53,11 @@ on:
         description: Test files for a narrow run (under test/, integration/ or e2e/), or empty for every job whole
         required: false
         default: ""
+        type: string
+      rounds:
+        description: How many times a narrow run's unit test files run in each unit job (a whole number, 1 to 60)
+        required: false
+        default: "1"
         type: string
 
 permissions:
@@ -904,7 +911,8 @@ jobs:
     needs: [plan, build]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.unit != '[]' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # A narrow run of several rounds takes as long as its rounds: three hours at most.
+    timeout-minutes: ${{ inputs.rounds != '1' && inputs.rounds != '' && 180 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -932,15 +940,32 @@ jobs:
           name: built-${{ matrix.side.name }}
 
       # FILES: a narrow run's test files at this commit, one word each, as the plan checked them; empty runs the shard.
+      # ROUNDS: a narrow run's files run that many times, each round with a report of its own (check-tests.r<n>.vitest.json);
+      # every round runs, and the step fails when any round failed. A whole run is always one round.
       - id: check-tests
         name: Unit tests
         env:
           RERAIL_PACK_FIXTURES_IN_CONFORMANCE: "1"
           SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.unit-total }}
           FILES: ${{ matrix.side.unit }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
-          # shellcheck disable=SC2086
-          npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+          rounds=1
+          if [ -n "$FILES" ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
+          if [ "$rounds" = 1 ]; then
+            # shellcheck disable=SC2086
+            npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+            exit $?
+          fi
+          failed=0
+          for ((r = 1; r <= rounds; r++)); do
+            echo "::group::round $r of $rounds"
+            # shellcheck disable=SC2086
+            npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.r$r.vitest.json" || failed=$((failed + 1))
+            echo "::endgroup::"
+          done
+          echo "rounds $rounds failed $failed" | tee "$RUNNER_TEMP/fork-ci/rounds.txt"
+          [ "$failed" = 0 ]
 
       - id: check-coverage
         name: Lint config coverage gate
@@ -972,7 +997,8 @@ jobs:
     needs: [plan, engine]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.windows != '[]' }}
     runs-on: windows-2025
-    timeout-minutes: 45
+    # A narrow run of several rounds takes as long as its rounds: four hours at most.
+    timeout-minutes: ${{ inputs.rounds != '1' && inputs.rounds != '' && 240 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -1022,9 +1048,25 @@ jobs:
           TMP: ${{ runner.temp }}
           SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.windows-total }}
           FILES: ${{ matrix.side.unit }}
+          ROUNDS: ${{ inputs.rounds }}
         run: |
-          # shellcheck disable=SC2086
-          npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+          # ROUNDS: as in the unit job above.
+          rounds=1
+          if [ -n "$FILES" ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
+          if [ "$rounds" = 1 ]; then
+            # shellcheck disable=SC2086
+            npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
+            exit $?
+          fi
+          failed=0
+          for ((r = 1; r <= rounds; r++)); do
+            echo "::group::round $r of $rounds"
+            # shellcheck disable=SC2086
+            npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.r$r.vitest.json" || failed=$((failed + 1))
+            echo "::endgroup::"
+          done
+          echo "rounds $rounds failed $failed" | tee "$RUNNER_TEMP/fork-ci/rounds.txt"
+          [ "$failed" = 0 ]
 
       - id: check-hook
         name: Claude Code hook integration test
