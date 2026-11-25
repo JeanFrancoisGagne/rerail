@@ -9,7 +9,8 @@
 # `files`, test files under test/, integration/ or e2e/ for a narrow run (commas or spaces between them), or empty for
 # every job whole; `rounds`, how many times a narrow run's unit test files run, one after the other, in each unit
 # job (1 unless given): every round runs and keeps a report of its own, and the job fails when any round failed. It
-# shows whether a test file fails by chance on these runners.
+# shows whether a test file fails by chance on these runners; `rounds_on`, the system whose unit job repeats them
+# (linux, windows or both: the other runs one round), for a file that takes minutes a round on one system.
 #
 # What differs from ci.yml, and why:
 # - The pack test data is not here. The rule packs' test data reaches ci.yml from S3 under the repository's OIDC role,
@@ -58,6 +59,11 @@ on:
         description: How many times a narrow run's unit test files run in each unit job (a whole number, 1 to 60)
         required: false
         default: "1"
+        type: string
+      rounds_on:
+        description: The system whose unit job repeats the rounds (linux, windows or both); the other runs one round
+        required: false
+        default: "both"
         type: string
 
 permissions:
@@ -949,9 +955,10 @@ jobs:
           SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.unit-total }}
           FILES: ${{ matrix.side.unit }}
           ROUNDS: ${{ inputs.rounds }}
+          ROUNDS_ON: ${{ inputs.rounds_on }}
         run: |
           rounds=1
-          if [ -n "$FILES" ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
+          if [ -n "$FILES" ] && [ "${ROUNDS_ON:-both}" != windows ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
           if [ "$rounds" = 1 ]; then
             # shellcheck disable=SC2086
             npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
@@ -1049,10 +1056,11 @@ jobs:
           SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.windows-total }}
           FILES: ${{ matrix.side.unit }}
           ROUNDS: ${{ inputs.rounds }}
+          ROUNDS_ON: ${{ inputs.rounds_on }}
         run: |
           # ROUNDS: as in the unit job above.
           rounds=1
-          if [ -n "$FILES" ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
+          if [ -n "$FILES" ] && [ "${ROUNDS_ON:-both}" != linux ] && [[ ${ROUNDS:-1} =~ ^[0-9]+$ ]] && [ "$ROUNDS" -gt 1 ] && [ "$ROUNDS" -le 60 ]; then rounds=$ROUNDS; fi
           if [ "$rounds" = 1 ]; then
             # shellcheck disable=SC2086
             npm test -- --shard="$SHARD" $FILES --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/fork-ci/check-tests.vitest.json"
