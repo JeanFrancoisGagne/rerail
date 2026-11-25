@@ -22,8 +22,10 @@
 # - Every job runs whole, as ci.yml runs on a push to main: the changes job's path filters are not applied. A job a pull
 #   request would skip still runs here, and its failures are read against main's the same way.
 # - The release engine is built once per engine tree and operating system (the plan job's id of native/, languages/,
-#   the Cargo files, the pinned toolchain and the napi CLI's version) and kept in the Actions cache under that id;
-#   every job that needs it restores it. ci.yml builds it in the build job and, on a miss, in each Windows shard.
+#   the Cargo files, the pinned toolchain and the napi CLI's version) and kept in the Actions cache under that id for
+#   later runs; the engine job takes it from there or builds it, and hands it to the jobs of its own run as an artifact
+#   of the run, so no job waits on a cache entry another job found. ci.yml builds it in the build job and, on a miss,
+#   in each Windows shard.
 # - The engine's Windows-only Rust tests, which ci.yml runs in a Windows shard when the engine's cache misses, run in
 #   a job of their own, at both commits, when the commit's engine tree differs from main's.
 # - The Rust test legs add --no-fail-fast, so a failing test binary does not hide the binaries after it.
@@ -33,7 +35,7 @@
 #
 # Main's results are kept: once every check at `base` has given a result, the keep job saves them in the Actions cache
 # under the base commit, the files of a narrow run and this workflow's commit, and a later run against the same base
-# restores them (the kept job) instead of running main's side again.
+# takes them in its plan job, which uploads them as its own, instead of running main's side again.
 
 name: CI at a chosen commit
 
@@ -260,14 +262,25 @@ jobs:
           print(f"head {head}, base {base}, {'whole' if whole else 'narrow: ' + ' '.join(files)}; engines differ: {engines_differ}")
           PLAN
 
-      # Main's results from an earlier run against the same base, files and workflow, when one kept them.
+      # Main's results from an earlier run against the same base, files and workflow, when one kept them. They are
+      # taken here and uploaded as this run's at once: an entry only looked up can be gone by the time a later job
+      # restores it, since a repository's caches share 10 GB and the least recently used go first.
       - id: kept
-        name: Look up main's kept results
+        name: Take main's kept results
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fork-ci-kept
           key: ${{ steps.commits.outputs.kept-key }}
-          lookup-only: true
+
+      - name: Upload main's kept results as this run's
+        if: steps.kept.outputs.cache-hit == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-ci-kept--base
+          path: fork-ci-kept/
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
 
       # With main's results kept, main's side runs only where they cannot stand in: the Windows Rust tests, which run
       # at both commits only when the engine trees differ. Each engine is built once per tree and OS for the sides
@@ -322,7 +335,8 @@ jobs:
           overwrite: true
 
   # The release engine, once per engine tree and OS: restored from the cache when an earlier run built it, else built
-  # as ci.yml's build job builds it and saved at once.
+  # as ci.yml's build job builds it and saved at once. Either way it is handed to this run's jobs as an artifact of
+  # the run: a cache entry can be evicted between this job and the job that needs the engine.
   engine:
     name: Engine (${{ matrix.label }}, ${{ matrix.sides }})
     needs: plan
@@ -348,7 +362,7 @@ jobs:
           persist-credentials: false
 
       - id: cached
-        name: Look up the engine
+        name: Take the engine an earlier run built
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -356,7 +370,6 @@ jobs:
             native/index.js
             native/index.d.ts
           key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tree }}
-          lookup-only: true
 
       - id: lfs
         if: steps.cached.outputs.cache-hit != 'true'
@@ -408,6 +421,21 @@ jobs:
             native/index.d.ts
           key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tree }}
 
+      # The files sit in native/, so the artifact holds them at its top and a job takes them back into native/.
+      - id: hand
+        name: Hand the engine to this run's jobs
+        if: steps.cached.outputs.cache-hit == 'true' || steps.check-engine.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.tree }}
+          path: |
+            native/*.node
+            native/index.js
+            native/index.d.ts
+          if-no-files-found: error
+          retention-days: 3
+          overwrite: true
+
       - name: Record the result
         if: always()
         env:
@@ -451,15 +479,11 @@ jobs:
         uses: ./.github/actions/lfs
 
       - id: engine
-        name: Restore the native engine
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        name: Take the native engine from this run's engine job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: |
-            native/*.node
-            native/index.js
-            native/index.d.ts
-          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
-          fail-on-cache-miss: true
+          name: engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
+          path: native
 
       - id: deps
         uses: ./.github/actions/node-deps
@@ -998,7 +1022,7 @@ jobs:
           overwrite: true
 
   # ci.yml's unit-windows job, five shards (one in a narrow run), with the Claude Code hook integration test on the
-  # first. The Windows engine comes from the engine job's cache entry for this commit's engine tree.
+  # first. The Windows engine comes from the engine job of this run, as its artifact for this commit's engine tree.
   unit-windows:
     name: Unit tests (Windows, ${{ matrix.shard }}/${{ needs.plan.outputs.windows-total }}, ${{ matrix.side.name }})
     needs: [plan, engine]
@@ -1028,15 +1052,11 @@ jobs:
         uses: ./.github/actions/lfs
 
       - id: engine
-        name: Restore the native engine
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        name: Take the native engine from this run's engine job
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          path: |
-            native/*.node
-            native/index.js
-            native/index.d.ts
-          key: fork-ci-engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
-          fail-on-cache-miss: true
+          name: engine-${{ runner.os }}-${{ runner.arch }}-${{ matrix.side.engine }}
+          path: native
 
       - id: deps
         uses: ./.github/actions/node-deps
@@ -1374,27 +1394,3 @@ jobs:
         with:
           path: fork-ci-kept
           key: ${{ needs.plan.outputs.kept-key }}
-
-  # Main's results an earlier run kept, uploaded as this run's.
-  kept:
-    name: Main's kept results
-    needs: plan
-    if: needs.plan.outputs.kept == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Restore main's results
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: fork-ci-kept
-          key: ${{ needs.plan.outputs.kept-key }}
-          fail-on-cache-miss: true
-
-      - name: Upload main's results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: fork-ci-kept--base
-          path: fork-ci-kept/
-          if-no-files-found: error
-          retention-days: 14
-          overwrite: true
