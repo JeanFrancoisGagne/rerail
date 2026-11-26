@@ -1,0 +1,1 @@
+The start check each hook makes and the status line's refresh ask the daemon for the folder's start state, which now looks up the folder's checkout once where it looked it up twice, and a read that names a checkout finds it once for its answer and its cache tag.
