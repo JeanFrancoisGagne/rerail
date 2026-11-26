@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// The Node built-ins only one module in src/ may use, each owned by the module that makes it safe on Windows.
+// The Node built-ins only one module in src/ or test/ may use, each owned by the module that makes it safe on Windows.
 //
 // Rerail fixes several classes of Windows defect by sending every use of a built-in through one module. Each row of
 // RULES names that module (the owner), the built-in modules, the names in them only the owner may reach (or none, when
-// no use is safe) or, for a row with `options`, the options only the owner may call them with, the files the rule
-// covers, and the reason:
+// no use is safe) or, for a row with `call`, the calls of them only the owner may make, the files the rule covers (and
+// any it exempts, with the reason), and the reason:
 //
 //   child-process   node:child_process, anywhere in src/. On Windows Node starts a child with a visible window unless
 //                   told otherwise, and a console program (git, node, npm, PowerShell) started by a process with no
@@ -27,6 +27,17 @@
 //                   level of the folder, each try at a folder removing its contents with a full set again: a file
 //                   Windows held one folder down kept a removal trying for minutes rather than 5.5 s.
 //
+// The rows over test/ keep every test on test/support/platform/remove-folder.ts, which removes the folders tests make.
+// On Windows a folder cannot be removed while a process runs in it or holds a file in it (EBUSY, EPERM). A test that
+// removed its temp folder with one `rm` failed whenever something still held it: a Git a session left running, a daemon
+// or database not closed, or antivirus scanning a file just written. The helper fails at once, naming the process, when
+// one the test started still runs there, and otherwise retries as Rerail's own removals do:
+//
+//   test-rm         rm and rmSync of node:fs called with `recursive`, or with options the check cannot read. Removing
+//                   one file (`rm(file)`, `rm(file, { force: true })`) is not a folder removal.
+//   test-rmdir      rmdir and rmdirSync of node:fs, called in any form.
+//   test-rimraf     rimraf, loaded as a value.
+//
 // One walk of each file finds every way to reach a name: an `import` (named, default or namespace), `import x =
 // require(...)`, the module's name as an argument of any call (`require`, `import()`, a `createRequire` result,
 // `module.require`, `process.getBuiltinModule`), then member access, destructuring and aliases of those
@@ -34,7 +45,8 @@
 // is a finding too: `export ... from` the module (named, `*` or `* as`), or a local `export` of a binding that holds
 // it. Type-only imports and `typeof import(...)` load nothing.
 //
-//   node scripts/check/check-owned-builtins.mjs   (npm run check:owned-builtins; part of npm run check)
+//   node scripts/check/check-owned-builtins.mjs   (npm run check:owned-builtins, over src/; part of npm run check)
+//   node scripts/check/check-folder-removal.mjs   (npm run check:folder-removal, over test/; part of npm run check)
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -57,12 +69,31 @@ export const KEYED = [
 ];
 
 const inSrc = path => path.startsWith("src/");
+const inTest = path => path.startsWith("test/");
 const keyed = path => KEYED.some(entry => (entry.endsWith("/") ? path.startsWith(entry) : path === entry));
+
+const REMOVE_FOLDER = "test/support/platform/remove-folder.ts";
+/** The files under test/ left to remove folders themselves, each with the reason. */
+const REMOVES_ITS_OWN = new Map([
+  ["test/scripts/ensure-sqlite.test.mjs", "runs under `node --test`, which cannot load the TypeScript helper"],
+  ["test/scripts/sql-execution-budget.test.mjs", "runs under `node --test`, which cannot load the TypeScript helper"],
+  ["test/scripts/sql-profile.test.mjs", "runs under `node --test`, which cannot load the TypeScript helper"],
+  ["test/scripts/sql-profile/session-parity.test.mjs", "runs under `node --test`, which cannot load the TypeScript helper"],
+  ["test/support/platform/remove-folder.test.ts", "shows the one try the helper replaces failing while a process runs in the folder"],
+  ["test/support/temporary/run-folder.ts", "runs in vitest's own process, not in a test: it makes writable a read-only folder a killed test left, puts back the owner file of a run folder it removed only in part, and leaves a folder it cannot remove for the next run after about 1 s of tries for its own and 100 ms for an ended run's, which the end of each run waits for, where the helper retries over 5.5 s"],
+]);
+const REMOVE_FOLDER_MESSAGE = `removes a folder directly; use removeFolder or removeFolderSync from ${REMOVE_FOLDER}, which names a process the test left running in it and waits out any other holder on Windows`;
+/** What the rows over test/ share: the helper owns every folder removal there, but in the files it exempts. */
+const IN_TESTS = { owner: REMOVE_FOLDER, exempt: REMOVES_ITS_OWN, covers: inTest, message: REMOVE_FOLDER_MESSAGE };
+
+/** A row's `call` that picks a call whose options may set one of `names`. */
+const givenAny = names => args => optionsSet(args[1], names);
 
 /**
  * One owned built-in: `names` are dotted paths inside each of `modules` (`constants.O_NOFOLLOW`); without them every
- * value use of the module is the owner's. With `options`, reaching the names is free and only a call of one given any of
- * those options is the owner's. `covers` picks the files the rule reads, the owner aside.
+ * value use of the module is the owner's. With `call`, reaching the names is free and only a call of one that `call`
+ * picks, given the call's arguments, is the owner's. `covers` picks the files the rule reads, the owner and the files
+ * `exempt` names aside.
  */
 export const RULES = [
   {
@@ -102,10 +133,13 @@ export const RULES = [
     owner: "src/engine/file-replace.ts",
     modules: FS,
     names: ["rm"],
-    options: ["maxRetries"],
+    call: givenAny(["maxRetries"]),
     covers: inSrc,
     message: "gives rm maxRetries, which rm repeats at every level of the folder, so a file Windows holds a folder down stalls the removal for minutes; use removeWithRetry from src/engine/file-replace.ts, which counts its own tries",
   },
+  { id: "test-rm", ...IN_TESTS, modules: FS, names: ["rm", "rmSync"], call: givenAny(["recursive"]) },
+  { id: "test-rmdir", ...IN_TESTS, modules: FS, names: ["rmdir", "rmdirSync"], call: () => true },
+  { id: "test-rimraf", ...IN_TESTS, modules: ["rimraf"] },
 ].map(rule => ({ ...rule, names: rule.names?.map(name => name.split(".")) }));
 
 const PROGRAM_PATH_MESSAGE = "names a program without its folder, which Windows looks for in the current folder first; pass an absolute path (windowsSystemProgram, programOnPath)";
@@ -202,11 +236,15 @@ function importBindings(node) {
 /** The property an object pattern's element reads: `a` in `{ a }`, `{ a: b }`, `{ "a": b }` and `{ ["a"]: b }`. */
 const elementKey = element => nameText(element.propertyName ?? element.name);
 
-/** Whether an object literal's property may set one of `names`: a spread, a key the check cannot read, or one of them. */
+/**
+ * Whether an object literal's property may set one of `names`: a spread, or a key the check cannot read or one of them,
+ * given any value but `false`, which asks for nothing (`recursive: false`).
+ */
 function propertySets(property, names) {
   if (ts.isSpreadAssignment(property)) return true;
   const key = nameText(property.name);
-  return key === undefined || names.includes(key);
+  if (key !== undefined && !names.includes(key)) return false;
+  return !ts.isPropertyAssignment(property) || property.initializer.kind !== ts.SyntaxKind.FalseKeyword;
 }
 
 /** Whether a call's options argument may set one of `names`: options that are no object literal may hold any. */
@@ -229,6 +267,25 @@ function startsBareProgram(call) {
 }
 
 const isArgument = node => ts.isCallExpression(node.parent) && node.parent.arguments.includes(node);
+
+/** Whether a function is the implementation a test gives a mock: `vi.mocked(rm).mockImplementation(async (p, o) => ...)`. */
+function isMockImplementation(implementation) {
+  const setter = implementation.parent;
+  return isArgument(implementation) && ts.isPropertyAccessExpression(setter.expression)
+    && (setter.expression.name.text === "mockImplementation" || setter.expression.name.text === "mockImplementationOnce");
+}
+
+/**
+ * Whether a call hands on the arguments of the mock implementation it is in, in order, as the real built-in's call
+ * (`(target, options) => actualRm(target, options)`): it makes the call the code under test made, not one of its own.
+ */
+function handsOnMockedCall(call) {
+  const implementation = ts.findAncestor(call.parent, ts.isFunctionLike);
+  if (implementation === undefined || !isMockImplementation(implementation)) return false;
+  const { parameters } = implementation;
+  return call.arguments.length === parameters.length && call.arguments.every((argument, index) =>
+    ts.isIdentifier(argument) && ts.isIdentifier(parameters[index].name) && argument.text === parameters[index].name.text);
+}
 
 const exported = node => node.modifiers?.some(modifier => modifier.kind === ts.SyntaxKind.ExportKeyword) === true;
 
@@ -255,16 +312,16 @@ const CHECKS = new Map([
   [ts.SyntaxKind.ExportSpecifier, ["checkLocalExport"]],
   [ts.SyntaxKind.ExportAssignment, ["checkExportAssignment"]],
   [ts.SyntaxKind.VariableStatement, ["checkExportedVariables"]],
-  [ts.SyntaxKind.CallExpression, ["checkProgram", "checkOptions"]],
+  [ts.SyntaxKind.CallExpression, ["checkProgram", "checkCall"]],
 ]);
 
 /** A file's walk: what each local name reaches inside a watched module, and every finding. */
 class Walk {
   constructor(source, rules) {
     this.source = source;
-    /** The rules on reaching a module or a name; {@link optionRules} are on the options a call of a name passes. */
-    this.rules = rules.filter(rule => rule.options === undefined);
-    this.optionRules = rules.filter(rule => rule.options !== undefined);
+    /** The rules on reaching a module or a name; {@link callRules} are on the calls of a name. */
+    this.rules = rules.filter(rule => rule.call === undefined);
+    this.callRules = rules.filter(rule => rule.call !== undefined);
     this.modules = new Set(rules.flatMap(rule => rule.modules));
     /** @type {Map<string, { module: string, path: string[] }>} */
     this.bindings = new Map();
@@ -431,12 +488,15 @@ class Walk {
     }
   }
 
-  /** A call of a name a rule with `options` owns, passing one of them: `rm(path, { maxRetries: 10 })`. */
-  checkOptions(call) {
+  /**
+   * A call of a name a rule with `call` owns, that the rule picks: `rm(path, { maxRetries: 10 })`, `rmdirSync(path)`. A
+   * mock implementation that hands its own arguments on to the real built-in makes the call of the code under test.
+   */
+  checkCall(call) {
     const reach = this.resolve(call.expression);
-    if (reach === undefined) return;
-    for (const rule of this.optionRules) {
-      if (reaches(rule, reach) && optionsSet(call.arguments[1], rule.options)) this.report(call, rule);
+    if (reach === undefined || handsOnMockedCall(call)) return;
+    for (const rule of this.callRules) {
+      if (reaches(rule, reach) && rule.call(call.arguments)) this.report(call, rule);
     }
   }
 
@@ -457,7 +517,7 @@ export function ownedBuiltinProblems(files, rules = RULES) {
   const problems = [];
   for (const { path, text } of files) {
     if (!CODE.test(path)) continue;
-    const applying = rules.filter(rule => rule.owner !== path && rule.covers(path));
+    const applying = rules.filter(rule => rule.owner !== path && rule.exempt?.has(path) !== true && rule.covers(path));
     if (applying.length === 0) continue;
     const walk = new Walk(parseSource(path, text), applying);
     walk.bind();
@@ -468,12 +528,20 @@ export function ownedBuiltinProblems(files, rules = RULES) {
   return problems;
 }
 
-if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const files = codeFiles(resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."), "src");
+/**
+ * The command `name` over the code files of `folder` (`src` or `test`) in this checkout: each problem on stderr as
+ * `path:line: [rule] message`, then `passed(files)` with the count of files read, or the count of problems, and exit 0
+ * when there is none, else 1.
+ */
+export function checkFolder(name, folder, passed) {
+  const files = codeFiles(resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."), folder);
   const problems = ownedBuiltinProblems(files);
   for (const { path, line, rule, message } of problems) console.error(`${path}:${line}: [${rule}] ${message}`);
-  console.log(problems.length === 0
-    ? `check-owned-builtins: ${files.length} files reach ${RULES.map(rule => rule.id).join(", ")} only through their owners`
-    : `check-owned-builtins: ${problems.length} problem(s)`);
+  console.log(`${name}: ${problems.length === 0 ? passed(files.length) : `${problems.length} problem(s)`}`);
   process.exit(problems.length === 0 ? 0 : 1);
+}
+
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const ids = RULES.filter(rule => inSrc(rule.owner)).map(rule => rule.id);
+  checkFolder("check-owned-builtins", "src", files => `${files} files reach ${ids.join(", ")} only through their owners`);
 }

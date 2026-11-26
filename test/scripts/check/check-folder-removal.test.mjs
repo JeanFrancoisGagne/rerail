@@ -1,13 +1,15 @@
-// scripts/check/check-folder-removal.mjs: every folder a test makes is removed through the helper that names a process
-// left running in it and waits out any other holder on Windows.
+// scripts/check/check-folder-removal.mjs, the rows of scripts/check/check-owned-builtins.mjs over test/: every folder a
+// test makes is removed through the helper that names a process left running in it and waits out any other holder on
+// Windows.
 
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { EXEMPT, folderRemovalProblems, HELPER } from "../../../scripts/check/check-folder-removal.mjs";
+import { ownedBuiltinProblems, RULES } from "../../../scripts/check/check-owned-builtins.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const { owner: HELPER, exempt: EXEMPT } = RULES.find(row => row.id === "test-rm");
 const rules = (problems) => problems.map(({ path, line, rule }) => `${path}:${line}:${rule}`);
 const places = (problems) => problems.map(({ path, line }) => `${path}:${line}`);
 
@@ -55,24 +57,24 @@ const FORMS = {
 
 describe("check-folder-removal", () => {
   it("flags a test that removes its temp folder directly", () => {
-    const problems = folderRemovalProblems([{
+    const problems = ownedBuiltinProblems([{
       path: "test/a.test.ts",
       text: 'import { mkdtemp, rm } from "node:fs/promises";\nafterEach(async () => {\n  await rm(root, { recursive: true, force: true });\n});\n',
     }]);
-    expect(rules(problems)).toEqual(["test/a.test.ts:3:direct"]);
+    expect(rules(problems)).toEqual(["test/a.test.ts:3:test-rm"]);
     expect(problems[0].message).toContain(HELPER);
   });
 
   it("flags every other way a test removes a folder itself", () => {
-    expect(rules(folderRemovalProblems([
+    expect(rules(ownedBuiltinProblems([
       { path: "test/b.test.ts", text: 'import { rmSync as remove } from "node:fs";\nremove(root, { force: true, recursive: true });\n' },
       { path: "test/c.test.ts", text: 'import * as fs from "node:fs";\nfs.rmSync(root, { recursive: true });\nfs.rmdirSync(root);\n' },
       { path: "test/d.test.mjs", text: 'import fs from "fs";\nawait fs.promises.rm(root, options);\n' },
       { path: "test/e.test.ts", text: 'import { promises as p } from "node:fs";\nawait p.rmdir(root);\nawait p.rm(root, { ...forced });\n' },
       { path: "test/support/f.ts", text: 'import { rimraf } from "rimraf";\n' },
     ]))).toEqual([
-      "test/b.test.ts:2:direct", "test/c.test.ts:2:direct", "test/c.test.ts:3:direct", "test/d.test.mjs:2:direct",
-      "test/e.test.ts:2:direct", "test/e.test.ts:3:direct", "test/support/f.ts:1:direct",
+      "test/b.test.ts:2:test-rm", "test/c.test.ts:2:test-rm", "test/c.test.ts:3:test-rmdir", "test/d.test.mjs:2:test-rm",
+      "test/e.test.ts:2:test-rmdir", "test/e.test.ts:3:test-rm", "test/support/f.ts:1:test-rimraf",
     ]);
   });
 
@@ -81,7 +83,7 @@ describe("check-folder-removal", () => {
     for (const [module, names] of Object.entries(REMOVALS)) {
       for (const name of names) {
         const { text, line } = FORMS[form](module, name);
-        const found = folderRemovalProblems([{ path: "test/a.test.ts", text }]).map(problem => problem.line);
+        const found = ownedBuiltinProblems([{ path: "test/a.test.ts", text }]).map(problem => problem.line);
         if (found.join() !== String(line)) missed.push(`${module} ${name}: lines [${found.join()}], expected ${line}\n${text}`);
       }
     }
@@ -89,14 +91,14 @@ describe("check-folder-removal", () => {
   });
 
   it("reads a key of rm's options it cannot name as one that may ask for recursive, and recursive: false as no", () => {
-    expect(places(folderRemovalProblems([{
+    expect(places(ownedBuiltinProblems([{
       path: "test/a.test.ts",
       text: 'import { rmSync } from "node:fs";\nrmSync(root, { ["recursive"]: true });\nrmSync(root, { [key]: true });\nrmSync(root, { force: true, recursive: false });\n',
     }]))).toEqual(["test/a.test.ts:2", "test/a.test.ts:3"]);
   });
 
   it("finds rimraf however a test loads it, and not a type-only import, which loads nothing", () => {
-    expect(places(folderRemovalProblems([
+    expect(places(ownedBuiltinProblems([
       { path: "test/a.test.ts", text: 'const { rimraf } = require("rimraf");\n' },
       { path: "test/b.test.ts", text: 'const { rimrafSync } = await import("rimraf");\n' },
       { path: "test/c.test.ts", text: 'import type { RimrafOptions } from "rimraf";\n' },
@@ -105,7 +107,7 @@ describe("check-folder-removal", () => {
 
   it("leaves to the code under test a mock that hands its call on to the real rm, and finds a removal a mock makes", () => {
     const mocked = 'vi.mock("node:fs/promises", { spy: true });\nconst { rm: actualRm } = await vi.importActual("node:fs/promises");\n';
-    expect(places(folderRemovalProblems([
+    expect(places(ownedBuiltinProblems([
       { path: "test/a.test.ts", text: `${mocked}vi.mocked(rm).mockImplementation(async (target, options) => await actualRm(target, options));\n` },
       { path: "test/b.test.ts", text: `${mocked}vi.mocked(rm).mockImplementationOnce(async (target) => {\n  await actualRm(target, { recursive: true });\n});\n` },
       { path: "test/c.test.ts", text: `${mocked}vi.mocked(rm).mockImplementation(async (target, options) => await actualRm(root, options));\n` },
@@ -113,7 +115,7 @@ describe("check-folder-removal", () => {
   });
 
   it("allows removing one file, the helper itself, the exempt files and code outside test/", () => {
-    expect(folderRemovalProblems([
+    expect(ownedBuiltinProblems([
       { path: "test/a.test.ts", text: 'import { rm, rmSync } from "node:fs/promises";\nawait rm(file);\nrmSync(file, { force: true, recursive: false });\n' },
       { path: "test/b.test.ts", text: 'import { removeFolder } from "./support/platform/remove-folder.js";\nawait removeFolder(root);\n' },
       { path: "test/c.test.ts", text: 'import type { rm } from "node:fs/promises";\nconst fake: typeof rm = async () => {};\nawait fake(root, { recursive: true });\n' },

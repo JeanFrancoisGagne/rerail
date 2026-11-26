@@ -138,13 +138,14 @@ describe("check-owned-builtins", () => {
   });
 
   it("allows any other rm, an rmSync given retries, and the retries in file-replace.ts", () => {
-    expect(ownedBuiltinProblems([
+    // The folder-removal row leaves test/d.ts alone; its recursive rm is test-rm's, a row over test/.
+    expect(rules(ownedBuiltinProblems([
       { path: rule("folder-removal").owner, text: 'import { rm } from "node:fs/promises";\nawait rm("x", { recursive: true, maxRetries: 10 });\n' },
       { path: "src/a.ts", text: 'import { rm } from "node:fs/promises";\nawait rm("x");\nawait rm("x", { force: true });\nawait rm("x", { recursive: true, force: true, ["force"]: true });\n' },
       { path: "src/b.ts", text: 'import { rmSync } from "node:fs";\nrmSync("x", { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });\n' },
       { path: "src/c.ts", text: 'import { removeWithRetry } from "./engine/file-replace.js";\nawait removeWithRetry("x");\nconst retries = { maxRetries: 10 };\n' },
       { path: "test/d.ts", text: 'import { rm } from "node:fs/promises";\nawait rm("x", { recursive: true, maxRetries: 10 });\n' },
-    ])).toEqual([]);
+    ]))).toEqual(["test/d.ts:2:test-rm"]);
   });
 
   it("flags a program named by a literal Windows would look for in the current folder", () => {

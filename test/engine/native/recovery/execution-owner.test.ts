@@ -41,7 +41,8 @@ it("shares immutable facts while snapshots and workspaces keep separate membersh
 
 it.skipIf(process.env.RERAIL_REQUIRE_PRODUCER_SHAPE !== "1")("constructs a shared SQL producer once per source version while executing each consumer", async () => {
   const { spawnSync } = await import("node:child_process");
-  const { mkdtempSync, readdirSync, rmSync } = await import("node:fs");
+  const { mkdtempSync, readdirSync } = await import("node:fs");
+  const { removeFolderSync } = await import("../../../support/platform/remove-folder.js");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const directory = mkdtempSync(join(tmpdir(), "rerail-shared-facts-"));
@@ -82,7 +83,7 @@ it.skipIf(process.env.RERAIL_REQUIRE_PRODUCER_SHAPE !== "1")("constructs a share
       }
     }
     expect(builds, "two source versions share across consumers; different definitions and source filters each construct separately").toBe(4);
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+  } finally { removeFolderSync(directory); }
 }, 35_000);
 
 it("uses document versions when workspaces release source strings before shared SQL preparation", async () => {
