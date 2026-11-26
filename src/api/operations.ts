@@ -294,11 +294,23 @@ function sessionResponse(stores: RerailApiStores, caller: ApiCaller, sessionId: 
 const sessionId = z.object({ sessionId: z.string().min(1) });
 
 /**
- * The `spelling` a presentation read passes for the folder `read` ({@link RerailApiStores.repositoryState}): the folder
- * as a Windows host spelt it, where it is an absolute path and `read` is the folder `repository` names; else none.
+ * `operation` with the start state of the folder its `repository` names read also under `spelling`, the folder as a
+ * Windows host spelt it ({@link RerailApiStores.repositoryState}); unchanged without one, or for any other folder.
  */
-function spellingOf({ repository, spelling }: { readonly repository: string; readonly spelling?: string | undefined }, read: string): string | undefined {
-  return spelling !== undefined && isAbsolute(spelling) && read === repository ? spelling : undefined;
+function readingSpelling(operation: Operation): Operation {
+  return { ...operation, handler: (stores, input, caller) => operation.handler(spelledStores(stores, input), input, caller) };
+}
+
+/** `stores` whose start-state read of `repository` passes `spelling` on; `stores` itself where it is no absolute path. */
+function spelledStores(stores: RerailApiStores, { repository, spelling }: { repository?: unknown; spelling?: unknown }): RerailApiStores {
+  if (typeof spelling !== "string" || !isAbsolute(spelling)) return stores;
+  const repositoryState = (workspace: string) => stores.repositoryState(workspace, workspace === repository ? spelling : undefined);
+  return new Proxy(stores, { get: (target, key) => key === "repositoryState" ? repositoryState : boundTo(target, Reflect.get(target, key)) });
+}
+
+/** `value` called on `target`, as a property read of `target` gives it: stores keep private fields a proxy cannot reach. */
+function boundTo(target: object, value: unknown): unknown {
+  return typeof value === "function" ? (value as (...parameters: unknown[]) => unknown).bind(target) : value;
 }
 
 const repositoryFilter = {
@@ -444,7 +456,7 @@ export const operations: readonly Operation[] = [
       return { removed: stores.preferences().remove(input.repository, input.host) };
     },
   }),
-  defineOperation({
+  readingSpelling(defineOperation({
     id: "presentation_get",
     method: "GET",
     path: "/api/presentation",
@@ -478,8 +490,7 @@ export const operations: readonly Operation[] = [
         } catch { session = null; }
       }
       const presence = stores.preferences().effective(repository, input.host);
-      // The start state and the scope come from one lookup of the folder's checkout in this request.
-      const repositoryState = stores.repositoryState(repository, spellingOf(input, repository));
+      const repositoryState = stores.repositoryState(repository);
       const checkout = stores.checkouts()(repository);
       const scope = checkout === undefined ? null : { repositoryKey: checkout.repositoryKey, checkoutPath: checkout.checkoutPath };
       if (input.sessionId === undefined) return { presence, repositoryState, scope };
@@ -487,7 +498,7 @@ export const operations: readonly Operation[] = [
       if (presence === "silent" && !input.onDemand) session = null;
       return { presence, repositoryState, scope, context: { daemon, session } };
     },
-  }),
+  })),
   defineOperation({
     id: "rules_activity",
     method: "GET",

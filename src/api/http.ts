@@ -125,6 +125,47 @@ function matchesEtag(header: string | undefined, etag: string): boolean {
   return header.split(",").some(candidate => candidate.trim() === etag);
 }
 
+/** One request to an operation's route, over the stores that serve that request alone (`inOneRequest`). */
+interface RouteRequest {
+  readonly operation: Operation;
+  readonly stores: RerailApiStores;
+  readonly input: Record<string, unknown>;
+  /** Sets the response's tag; 304 with no body when `If-None-Match` names it, else undefined. */
+  readonly conditional: (etag: string) => Response | undefined;
+  /** 200 with `result` as its body. */
+  readonly answer: (result: unknown) => Response;
+}
+
+/** 304 for a {@link DATABASE_ETAG_OPERATIONS} read whose tag the request already holds; undefined when it must run. */
+function unchangedSinceTag({ operation, stores, input, conditional }: RouteRequest, instanceSalt: string): Response | undefined {
+  // `dataVersion()` is a `PRAGMA data_version` read plus a local write counter, so it
+  // catches commits from other processes as well as this daemon's own, at constant cost. A read for one
+  // checkout also depends on that checkout's own rules (`.rerail/rules`).
+  const checkout = typeof input.checkout === "string" ? checkoutAt(stores, input.checkout, false).checkout : undefined;
+  const digest = checkoutRuleCatalog(stores, checkout).digest;
+  return conditional(entityTag(operation.id, instanceSalt, normalizedInput(input), stores.dataVersion(), digest));
+}
+
+/** A {@link RESULT_ETAG_OPERATIONS} read: the result `remembered` holds while what dates it is unchanged, else a new one. */
+async function rememberedAnswer(request: RouteRequest, remembered: Map<string, RememberedResult>): Promise<Response> {
+  const { operation, stores, input, conditional, answer } = request;
+  const key = `${operation.id}\u0000${normalizedInput(input)}`;
+  // The history a result reads, and the rule catalog (`rules_activity` lists the installed packs' rules), so
+  // a pack installed or removed shows without waiting for a session to write.
+  const history = stores.historyVersion();
+  const version = history === undefined ? undefined : `${history}\u0000${stores.ruleCatalog().digest}`;
+  const known = remembered.get(key);
+  if (known !== undefined && known.version === version) {
+    return conditional(known.etag) ?? answer(known.result);
+  }
+  const result = await invokeOperation(operation, stores, input, { kind: "person" });
+  const etag = entityTag(operation.id, JSON.stringify(result) ?? "");
+  remembered.delete(key);
+  if (version !== undefined) remembered.set(key, { version, etag, result });
+  if (remembered.size > REMEMBERED_RESULTS) remembered.delete(remembered.keys().next().value!);
+  return conditional(etag) ?? answer(result);
+}
+
 /**
  * Hostnames a browser reaches a local daemon by. A DNS-rebinding page resolves its own name to
  * 127.0.0.1, so the socket cannot tell it apart; only the `Host` header (the name the browser
@@ -315,40 +356,20 @@ export function createRerailApi(
     app.openapi(route, (context: Context) => inOneRequest(stores, operation.method, async stores => {
       const validated = context.req as unknown as { valid(target: "param" | "query" | "json"): Record<string, unknown> | undefined };
       const input = { ...validated.valid("param"), ...validated.valid("query"), ...validated.valid("json") };
-      const conditional = (etag: string): Response | undefined => {
-        context.header("etag", etag);
-        return matchesEtag(context.req.header("if-none-match"), etag) ? context.body(null, 304) : undefined;
+      const request: RouteRequest = {
+        operation, stores, input,
+        conditional: etag => {
+          context.header("etag", etag);
+          return matchesEtag(context.req.header("if-none-match"), etag) ? context.body(null, 304) : undefined;
+        },
+        answer: result => context.json(result, 200),
       };
       try {
-        if (DATABASE_ETAG_OPERATIONS.has(operation.id)) {
-          // `dataVersion()` is a `PRAGMA data_version` read plus a local write counter, so it
-          // catches commits from other processes as well as this daemon's own, at constant cost. A read for one
-          // checkout also depends on that checkout's own rules (`.rerail/rules`).
-          const checkout = typeof input.checkout === "string" ? checkoutAt(stores, input.checkout, false).checkout : undefined;
-          const digest = checkoutRuleCatalog(stores, checkout).digest;
-          const unchanged = conditional(entityTag(operation.id, instanceSalt, normalizedInput(input), stores.dataVersion(), digest));
-          if (unchanged !== undefined) return unchanged;
-        }
-        if (RESULT_ETAG_OPERATIONS.has(operation.id)) {
-          const key = `${operation.id}\u0000${normalizedInput(input)}`;
-          // The history a result reads, and the rule catalog (`rules_activity` lists the installed packs' rules), so
-          // a pack installed or removed shows without waiting for a session to write.
-          const history = stores.historyVersion();
-          const version = history === undefined ? undefined : `${history}\u0000${stores.ruleCatalog().digest}`;
-          const known = remembered.get(key);
-          if (known !== undefined && known.version === version) {
-            return conditional(known.etag) ?? context.json(known.result, 200);
-          }
-          const result = await invokeOperation(operation, stores, input, { kind: "person" });
-          const etag = entityTag(operation.id, JSON.stringify(result) ?? "");
-          remembered.delete(key);
-          if (version !== undefined) remembered.set(key, { version, etag, result });
-          if (remembered.size > REMEMBERED_RESULTS) remembered.delete(remembered.keys().next().value!);
-          return conditional(etag) ?? context.json(result, 200);
-        }
+        const unchanged = DATABASE_ETAG_OPERATIONS.has(operation.id) ? unchangedSinceTag(request, instanceSalt) : undefined;
+        if (unchanged !== undefined) return unchanged;
+        if (RESULT_ETAG_OPERATIONS.has(operation.id)) return await rememberedAnswer(request, remembered);
         // `/api` callers are people (the dashboard, the CLI); coding agents come through `/mcp`.
-        const result = await invokeOperation(operation, stores, input, { kind: "person" });
-        return context.json(result, 200);
+        return request.answer(await invokeOperation(operation, stores, input, { kind: "person" }));
       } catch (error) {
         if (error instanceof ApiError) return context.json({ error: error.code, message: error.message }, error.status as 400);
         throw error;

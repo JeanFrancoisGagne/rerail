@@ -132,14 +132,13 @@ function folderOf(folder: string): string {
   }
 }
 
-/** The repository `key` names, by its own key or an alias; a request lists the repositories once. */
-function findRepository(stores: RerailApiStores, key: string): RepositoryListing | undefined {
-  return askedOnce(stores, "repositories", () => listRepositories(stores.database()))
-    .find(repository => repository.repositoryKey === key || repository.aliases.includes(key));
+/** The repository `key` names, by its own key or an alias. */
+function findRepository(db: RerailDatabase, key: string): RepositoryListing | undefined {
+  return listRepositories(db).find(repository => repository.repositoryKey === key || repository.aliases.includes(key));
 }
 
-function requireRepository(stores: RerailApiStores, key: string): RepositoryListing {
-  const repository = findRepository(stores, key);
+function requireRepository(db: RerailDatabase, key: string): RepositoryListing {
+  const repository = findRepository(db, key);
   if (repository === undefined) throw new ApiError(404, "repository-not-found", `repository ${key} is not known to Rerail`);
   return repository;
 }
@@ -164,6 +163,7 @@ export function checkoutAt(stores: RerailApiStores, path: string, write: boolean
   return askedOnce(stores, `checkout at\u0000${write}\u0000${path}`, () => locatedCheckout(stores, path, write));
 }
 
+/** {@link checkoutAt}, asked of the stores. */
 function locatedCheckout(stores: RerailApiStores, path: string, write: boolean): { checkout: CheckoutContext; folder: string } {
   let physical: string;
   try {
@@ -172,11 +172,15 @@ function locatedCheckout(stores: RerailApiStores, path: string, write: boolean):
     throw checkoutNotFound(path);
   }
   const checkout = stores.checkouts()(physical);
-  const recorded = checkout !== undefined && (!write || stores.database().select({ path: checkouts.checkoutPath }).from(checkouts)
-    .where(eq(checkouts.checkoutPath, checkout.checkoutPath)).get() !== undefined);
-  if (checkout === undefined || !recorded) throw checkoutNotFound(path);
+  if (checkout === undefined || (write && !recordedItself(stores, checkout))) throw checkoutNotFound(path);
   const inside = within(checkout.checkoutPath, physical);
   return { checkout, folder: inside === undefined ? "" : folderOf(inside.split(sep).join("/")) };
+}
+
+/** Whether Rerail recorded `checkout` itself, not only its clone. */
+function recordedItself(stores: RerailApiStores, checkout: CheckoutContext): boolean {
+  return stores.database().select({ path: checkouts.checkoutPath }).from(checkouts)
+    .where(eq(checkouts.checkoutPath, checkout.checkoutPath)).get() !== undefined;
 }
 
 /** The repository a coding agent's own checkout belongs to; undefined for a person, or an agent whose call names no checkout. */
@@ -223,8 +227,8 @@ export function resolveTarget(stores: RerailApiStores, input: TargetInput, calle
   if (located === undefined && input.repository === undefined) {
     throw new ApiError(400, "target-required", "name a repository or a checkout");
   }
-  const repository = requireRepository(stores, located?.checkout.repositoryKey ?? input.repository!);
-  if (located !== undefined && input.repository !== undefined && findRepository(stores, input.repository)?.repositoryKey !== repository.repositoryKey) {
+  const repository = requireRepository(db, located?.checkout.repositoryKey ?? input.repository!);
+  if (located !== undefined && input.repository !== undefined && findRepository(db, input.repository)?.repositoryKey !== repository.repositoryKey) {
     throw new ApiError(400, "target-mismatch", `checkout ${located.checkout.checkoutPath} belongs to ${repository.repositoryKey}, not ${input.repository}`);
   }
   guardAgentRepository(stores, caller, repository, located?.checkout, write ? "changes rules and settings" : "reads");
@@ -281,7 +285,7 @@ export function repositorySummary(repository: RepositoryListing): z.infer<typeof
  * only itself.
  */
 export function historyRepositoryIds(stores: RerailApiStores, key: string): string[] {
-  const repository = findRepository(stores, key);
+  const repository = findRepository(stores.database(), key);
   return repository === undefined ? [key] : repositoryHistoryIds(repository);
 }
 
@@ -298,7 +302,7 @@ export function historyScope(stores: RerailApiStores, caller: ApiCaller, reposit
       `a coding agent reads only the history of the repository it works in; connect through Rerail's MCP bridge from a session in that repository, which names it in ${CALLER_CWD_HEADER}`);
   }
   const { repositoryKey } = checkoutAt(stores, caller.checkout, false).checkout;
-  if (repository !== undefined && repository !== repositoryKey && findRepository(stores, repository)?.repositoryKey !== repositoryKey) {
+  if (repository !== undefined && repository !== repositoryKey && findRepository(stores.database(), repository)?.repositoryKey !== repositoryKey) {
     throw new ApiError(403, "agent-not-permitted",
       `a coding agent reads only the history of the repository it works in, ${repositoryKey}; a person can read ${repository}'s in the dashboard`);
   }
@@ -667,7 +671,7 @@ export const repositoryOperations: readonly Operation[] = [
         for (const entry of remove) removeAttachment(tx, { repositoryKey, ...entry });
       }, { behavior: "immediate" });
       return {
-        repository: repositorySummary(requireRepository(stores, repositoryKey)),
+        repository: repositorySummary(requireRepository(db, repositoryKey)),
         attachments: attachmentsOf(db, repositoryKey),
         ...blockNote(changes.map(change => change.mode)),
       };
@@ -725,7 +729,7 @@ export const repositoryOperations: readonly Operation[] = [
       const repositoryKey = target.repository.repositoryKey;
       db.update(repositories).set({ followGitignore: input.followGitignore, updatedAt: Date.now() })
         .where(eq(repositories.repositoryKey, repositoryKey)).run();
-      return { repository: repositorySummary(requireRepository(stores, repositoryKey)) };
+      return { repository: repositorySummary(requireRepository(db, repositoryKey)) };
     },
   }),
   defineOperation({
@@ -940,7 +944,7 @@ function guardRepositoriesUsing(stores: RerailApiStores, caller: ApiCaller, rule
   const db = stores.database();
   const users = db.selectDistinct({ key: ruleAttachments.repositoryKey }).from(ruleAttachments)
     .where(and(eq(ruleAttachments.sourceKind, "library_rule"), eq(ruleAttachments.sourceId, ruleId))).all();
-  for (const { key } of users) guardAgent(stores, caller, { repository: requireRepository(stores, key), checkout: undefined, folder: "" }, allowed);
+  for (const { key } of users) guardAgent(stores, caller, { repository: requireRepository(db, key), checkout: undefined, folder: "" }, allowed);
 }
 
 /**
@@ -962,7 +966,7 @@ export function activityRules(
       ...listLibraryRules(db).map(rule => ({ id: rule.document.rule.id, kind: rule.document.kind, rule: rule.document.rule as unknown, notRun: null })),
     ];
   }
-  const repository = findRepository(stores, key);
+  const repository = findRepository(db, key);
   if (repository === undefined) return [];
   const present = new Map(listRepositoryRules(db, ruleCatalog, repository.repositoryKey).rules
     .map(rule => [rule.document.rule.id, { kind: rule.document.kind, rule: rule.document.rule as unknown, notRun: rule.notRun }] as const));
@@ -987,7 +991,7 @@ function startOrStop(
     setCheckoutStarted(db, target.checkout, started);
   }
   return {
-    repository: repositorySummary(requireRepository(stores, target.repository.repositoryKey)),
+    repository: repositorySummary(requireRepository(db, target.repository.repositoryKey)),
     checkout: target.checkout === undefined ? null : {
       checkoutPath: target.checkout.checkoutPath,
       state: stateOf(effectiveStatus(db, target.checkout)),

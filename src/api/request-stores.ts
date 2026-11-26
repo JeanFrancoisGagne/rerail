@@ -1,8 +1,8 @@
 /**
- * The stores one request reads through. A read asks each lookup once: the checkout at a folder, the repositories Rerail
- * knows and the rule catalog. Before, `GET /api/presentation` found its folder's checkout through two resolvers, and a
- * coding agent's read found its own checkout again in each helper that guards it, each time reading the identity file,
- * the real path and the database.
+ * The stores one request reads through. A read asks each lookup once: the checkout at a folder and the rule catalog.
+ * Before, `GET /api/presentation` found its folder's checkout through two resolvers, the tag check of a read and its
+ * handler each found the checkout and read the catalog, and a coding agent's read found its own checkout again in each
+ * helper that guards it, each time reading the identity file, the real path and the database.
  */
 import type { RepositoryStartState } from "../engine/catalog/repository-model.js";
 import { spelledCheckout } from "../engine/catalog/repository-registry.js";
