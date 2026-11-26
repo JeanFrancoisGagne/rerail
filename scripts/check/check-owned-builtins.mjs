@@ -316,8 +316,7 @@ const CHECKS = new Map([
 ]);
 /** The checks that report only rules with names, which a walk under none of them, as over test/, leaves out. */
 const NAMED_ONLY = new Set(["checkBindings", "checkMember", "checkLocalExport", "checkExportAssignment", "checkExportedVariables"]);
-const UNNAMED_CHECKS = new Map([...CHECKS].map(([kind, names]) => [kind, names.filter(name => !NAMED_ONLY.has(name))]));
-const NO_CHECKS = [];
+const UNNAMED_CHECKS = new Map([...CHECKS].map(([kind, names]) => [kind, names.filter(name => !NAMED_ONLY.has(name))]).filter(([, names]) => names.length > 0));
 
 /** A file's walk: what each local name reaches inside a watched module, and every finding. */
 class Walk {
@@ -332,8 +331,9 @@ class Walk {
     this.bindings = new Map();
     /** @type {Map<string, { line: number, rule: string, message: string }>} */
     this.found = new Map();
-    /** Whether a string in the file names a watched module, which {@link bind} reads. */
+    /** Whether a string in the file names a watched module, and the nodes {@link check} reads: {@link bind} sets both. */
     this.named = false;
+    this.visits = [];
   }
 
   report(at, rule, message = rule.message, id = rule.id) {
@@ -388,15 +388,16 @@ class Walk {
   /**
    * Records every binding to a watched module before {@link check} reads a use, so a use above its binding resolves,
    * and whether the file names a watched module at all (`named`): every reach starts at a string that names one. The
-   * first pass reads every node; the next read the declarations it found, until one adds no binding: an alias written
-   * above the binding it copies (`const n = m` in a function above `const m = require(...)`) is bound only on the
-   * second pass, and a use written above the alias needs it.
+   * first pass reads every node and keeps, in order, those {@link check} reads (`visits`); the next read the
+   * declarations it found, until one adds no binding: an alias written above the binding it copies (`const n = m` in a
+   * function above `const m = require(...)`) is bound only on the second pass, and a use written above the alias needs it.
    */
   bind() {
     const declarations = [];
     eachNode(this.source, (node) => {
       this.named ||= this.namesModule(node);
       if (ts.isVariableDeclaration(node) || isImport(node)) declarations.push(node);
+      if (this.checks.has(node.kind)) this.visits.push(node);
     });
     const ignore = () => {};
     for (let size = -1; size !== this.bindings.size;) {
@@ -454,9 +455,9 @@ class Walk {
    */
   check() {
     if (!this.named && !this.rules.some(rule => rule.programPath === true)) return;
-    eachNode(this.source, (node) => {
-      for (const name of this.checks.get(node.kind) ?? NO_CHECKS) this[name](node);
-    });
+    for (const node of this.visits) {
+      for (const name of this.checks.get(node.kind)) this[name](node);
+    }
   }
 
   /** An import or variable that binds an owned name: `import { rename } from "node:fs"`, `const { rename } = fs`. */
