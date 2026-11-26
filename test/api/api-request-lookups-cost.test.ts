@@ -106,8 +106,9 @@ async function cost(app: ReturnType<typeof createRerailApi>, path: string): Prom
 describe("one request's lookups", () => {
   it("finds the checkout of GET /api/presentation's folder once, for its start state and its scope", async () => {
     const { main, http } = await daemon();
-    // Status, statements, identity files, real paths.
-    expect(await cost(http, presentation(main))).toEqual([200, 5, 1, 1]);
+    // Status, statements, identity files, real paths: one real path is the checkout's, the other the key the person's
+    // presentation setting is saved under.
+    expect(await cost(http, presentation(main))).toEqual([200, 5, 1, 2]);
   });
 
   it("finds the checkout of GET /api/repository/rules once, for its tag and its answer", async () => {
