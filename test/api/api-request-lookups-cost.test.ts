@@ -86,8 +86,11 @@ async function daemon() {
 
 const presentation = (repository: string) => `/api/presentation?${new URLSearchParams({ repository, host: "claude-code" })}`;
 
-/** What one request costs once the daemon has answered it before: statements, identity-file reads and real paths. */
-async function cost(app: ReturnType<typeof createRerailApi>, path: string) {
+/**
+ * What one request costs once the daemon has answered it before: its status, then the statements it ran, the identity
+ * files it opened and the real paths it asked for. A list, so a failure prints every count.
+ */
+async function cost(app: ReturnType<typeof createRerailApi>, path: string): Promise<[number, number, number, number]> {
   await app.request(path);
   statements.run = fileCalls.identityReads = fileCalls.realpaths = 0;
   statements.on = fileCalls.on = true;
@@ -97,19 +100,20 @@ async function cost(app: ReturnType<typeof createRerailApi>, path: string) {
   } finally {
     statements.on = fileCalls.on = false;
   }
-  return { status: response.status, statements: statements.run, identityReads: fileCalls.identityReads, realpaths: fileCalls.realpaths };
+  return [response.status, statements.run, fileCalls.identityReads, fileCalls.realpaths];
 }
 
 describe("one request's lookups", () => {
   it("finds the checkout of GET /api/presentation's folder once, for its start state and its scope", async () => {
     const { main, http } = await daemon();
-    expect(await cost(http, presentation(main))).toEqual({ status: 200, statements: 5, identityReads: 1, realpaths: 1 });
+    // Status, statements, identity files, real paths.
+    expect(await cost(http, presentation(main))).toEqual([200, 5, 1, 1]);
   });
 
   it("finds the checkout of GET /api/repository/rules once, for its tag and its answer", async () => {
     const { main, http } = await daemon();
     const rules = `/api/repository/rules?${new URLSearchParams({ checkout: main })}`;
-    expect(await cost(http, rules)).toEqual({ status: 200, statements: 9, identityReads: 1, realpaths: 2 });
+    expect(await cost(http, rules)).toEqual([200, 11, 1, 2]);
   });
 
   it("answers the next request from what is recorded then: a checkout recorded, a repository stopped, a rule added", async () => {
@@ -124,12 +128,16 @@ describe("one request's lookups", () => {
     db.update(repositories).set({ started: false }).where(eq(repositories.repositoryKey, repositoryKey)).run();
     expect(await shown(main)).toMatchObject({ repositoryState: "stopped" });
 
-    // The tag of a checkout's rules reads its own rules folder: a rule file added there is a new answer, not a 304.
+    // The tag of a checkout's rules reads its own rules folder: a rule added there is a new answer, not a 304.
     const rules = `/api/repository/rules?${new URLSearchParams({ checkout: main })}`;
     const tag = (await http.request(rules)).headers.get("etag")!;
     const again = (await http.request(rules, { headers: { "if-none-match": tag } })).status;
     mkdirSync(join(main, ".rerail", "rules"), { recursive: true });
-    writeFileSync(join(main, ".rerail", "rules", "local.json"), "{}\n");
+    writeFileSync(join(main, ".rerail", "rules", "local.json"), JSON.stringify({
+      format: "rerail.policy/v1", id: "local-needle", revision: 1, mode: "steer", description: "Keep NEEDLE out of Python files.",
+      scope: { include: ["**/*.py"], exclude: [] },
+      clauses: [{ id: "needle", violation: { code: "NEEDLE", anchor: "witness.span", message: "No NEEDLE" }, forbid: { regex: { pattern: "NEEDLE", source: "file.content" } } }],
+    }));
     const after = await http.request(rules, { headers: { "if-none-match": tag } });
     expect([again, after.status, after.headers.get("etag") === tag]).toEqual([304, 200, false]);
   });
