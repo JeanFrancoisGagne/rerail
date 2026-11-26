@@ -6,7 +6,7 @@ import { loadRuleCatalog } from "../engine/catalog/rule-catalog.js";
 import { BLOCK_STEERS_NOTE } from "../engine/catalog/rule-mode.js";
 import type { UpdateResult } from "../setup/updater.js";
 import { NO_PROGRESS, type Progress } from "../runtime/progress.js";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { defaultRerailDatabasePath, eraseFreedPages, openRerailDatabase, resetRepositoryHistoryIn, type RerailDatabase } from "../engine/storage/database.js";
 import { STATUS_LINES_FOLDER } from "../engine/storage/rerail-home.js";
 import { removeUnrecordedStatusFiles } from "../presentation/claude-status-files.js";

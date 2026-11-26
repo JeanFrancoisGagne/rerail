@@ -21,6 +21,7 @@ import { startRemoteSink, type RemoteSinkLoop } from "../runtime/remote-outbox.j
 import { chooseEngineSocketPath, engineWorktreeWalks, startEngineService, type EngineService } from "../runtime/engine-service.js";
 import { engineIdentity, enginePipeName, fallbackPipe } from "../runtime/daemon/engine-pipe.js";
 import { resolveSessionPaths } from "../runtime/session-paths.js";
+import { parseArguments, type ParsedArguments } from "../runtime/command-arguments.js";
 import type { UntakenPass } from "../engine/storage/untaken-events.js";
 import { createMergeAssistService, type MergeAssistRuntime } from "../runtime/merge-assist/service.js";
 import { NativeSessionServer } from "./native-session-server.js";
@@ -982,35 +983,8 @@ async function serveStatic(pathname: string, headOnly: boolean, uiRoot: string, 
   return new Response(Readable.toWeb(createReadStream(target)) as unknown as ReadableStream, { status: 200, headers: full });
 }
 
-/** Parsed `--flag` / `--option value` arguments; every name is validated against the accepted sets. */
-export interface ParsedArguments {
-  flags: ReadonlySet<string>;
-  options: ReadonlyMap<string, string>;
-}
-
-export function parseArguments(
-  argv: readonly string[],
-  accepted: { flags: readonly string[]; options: readonly string[] },
-  unknownMessage: (argument: string) => string,
-): ParsedArguments {
-  const flags = new Set<string>();
-  const options = new Map<string, string>();
-  let index = 0;
-  while (index < argv.length) {
-    const argument = argv[index] ?? "";
-    if (accepted.flags.includes(argument)) {
-      flags.add(argument);
-      index += 1;
-      continue;
-    }
-    if (!accepted.options.includes(argument)) throw new Error(unknownMessage(argument));
-    const value = argv[index + 1];
-    if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
-    options.set(argument, value);
-    index += 2;
-  }
-  return { flags, options };
-}
+/** The daemon's tests read its launch arguments with the parser from this module, as the daemon reads its own. */
+export { parseArguments };
 
 interface DaemonArguments {
   host: string;

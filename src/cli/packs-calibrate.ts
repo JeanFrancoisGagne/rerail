@@ -8,7 +8,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { and, asc, eq } from "drizzle-orm";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import type { LintConfigOutcome, LintConfigSetting, RepositoryLintConfig } from "../engine/catalog/lint-config/linter-config.js";
 import { readRepositoryLintConfig } from "../engine/catalog/lint-config/repository-lint-config.js";
 import { repositoryIdentityLocation, repositoryName } from "../engine/catalog/repository-identity.js";

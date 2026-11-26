@@ -7,7 +7,7 @@
 import { existsSync, lstatSync, readFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { and, eq } from "drizzle-orm";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { loadRuleCatalog } from "../engine/catalog/rule-catalog.js";
 import { repositoryIdentityLocation, repositoryName } from "../engine/catalog/repository-identity.js";
 import type { RepositoryKey } from "../engine/catalog/repository-model.js";

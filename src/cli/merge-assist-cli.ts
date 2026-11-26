@@ -8,7 +8,7 @@
  */
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { repositoryFolderName, repositoryIdentityLocation } from "../engine/catalog/repository-identity.js";
 import { experimentOffMessage, mergeAssistExperimentEnabled } from "../engine/experimental-features.js";
 import { sideName } from "../engine/merge-assist/conflict-note.js";

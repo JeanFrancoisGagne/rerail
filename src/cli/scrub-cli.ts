@@ -3,7 +3,7 @@ import { type FileHandle, opendir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { deserialize, serialize } from "node:v8";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { storedFailures, storedViolations } from "../engine/audit/audit-store.js";
 import type { AuditFailure } from "../engine/audit/audit.js";
 import type { CodeRuleViolation } from "../engine/code-rule/code-rule.js";

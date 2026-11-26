@@ -57,7 +57,8 @@ import {
   type OlderDaemon,
   type StopDaemonResult,
 } from "../runtime/daemon-control.js";
-import { DAEMON_PORT_FILE, DEFAULT_DAEMON_PORT, parseArguments, parsePort } from "../daemon/daemon.js";
+import { DAEMON_PORT_FILE, DEFAULT_DAEMON_PORT, parsePort } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { ACTIVE_PROFILE_FILE, PROFILES_DIR } from "../activation/customer-profile.js";
 import { DEVICE_SECRETS_DIR, deviceSecretStore } from "../activation/device-keystore.js";
 import { isDefaultStorageRoot, resolveSessionPaths } from "../runtime/session-paths.js";

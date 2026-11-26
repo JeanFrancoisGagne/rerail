@@ -15,7 +15,7 @@ import { replaceFileSync } from "../engine/file-replace.js";
 import { arch, homedir, hostname, platform, release, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { and, asc, count, desc, eq, inArray, sql } from "drizzle-orm";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { SqliteAuditReader } from "../engine/audit/audit-store.js";
 import type { AuditRecord } from "../engine/audit/audit.js";
 import { repositoryIdentityLocation } from "../engine/catalog/repository-identity.js";

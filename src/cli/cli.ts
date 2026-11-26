@@ -34,12 +34,11 @@ import {
   DAEMON_TRANSPORT_OPTIONS,
   DEFAULT_DAEMON_HOST,
   loopbackOnlyNotice,
-  parseArguments,
   parseDaemonTransport,
   parsePort,
   parsePublicHosts,
-  type ParsedArguments,
 } from "../daemon/daemon.js";
+import { parseArguments, type ParsedArguments } from "../runtime/command-arguments.js";
 import { commitEveryWriteDurably, defaultRerailDatabasePath, openRerailDatabase, RERAIL_DATABASE_FILE } from "../engine/storage/database.js";
 import {
   accessTokenKept,

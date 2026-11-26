@@ -4,7 +4,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { resolveModelPath } from "../runtime/session-paths.js";
 import { z } from "zod";
 import { libraryUpsertBodySchema } from "../api/repository-contracts.js";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { defaultRerailDatabasePath, openRerailDatabase, type RerailDatabase } from "../engine/storage/database.js";
 import { defaultRerailHome } from "../engine/storage/rerail-home.js";
 import { activeCoreVersion, installedPackDirectories, loadRuleCatalog, readRuleCatalog } from "../engine/catalog/rule-catalog.js";

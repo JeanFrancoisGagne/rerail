@@ -4,7 +4,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { lookupCheckout } from "../engine/catalog/repository-registry.js";
 import { readCloneId, readRemoteAddress, repositoryIdentityLocation, repositoryKeyOf } from "../engine/catalog/repository-identity.js";
 import { openRerailDatabase, RERAIL_DATABASE_FILE } from "../engine/storage/database.js";

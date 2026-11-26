@@ -5,7 +5,7 @@
  */
 import { existsSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { repositoryIdentityLocation } from "../engine/catalog/repository-identity.js";
 import { activeCoreVersion, installedPackDirectories, loadRuleCatalog } from "../engine/catalog/rule-catalog.js";
 import { isWorktreePack, WORKTREE_PACK_ID, worktreeRuleCatalog, worktreeRulesDirectory } from "../engine/catalog/worktree-pack.js";

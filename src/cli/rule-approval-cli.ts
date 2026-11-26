@@ -6,7 +6,7 @@
  */
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { repositoryIdentityLocation } from "../engine/catalog/repository-identity.js";
 import { approvalKey, approve, currentSubject, packSubject, readApprovals, ruleSubject, type RuleApprovalSubject } from "../engine/catalog/rule-approval.js";
 import { activeCoreVersion, loadRuleCatalog } from "../engine/catalog/rule-catalog.js";

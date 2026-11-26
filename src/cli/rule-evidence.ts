@@ -3,7 +3,7 @@ import { access, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { and, asc, desc, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
-import { parseArguments } from "../daemon/daemon.js";
+import { parseArguments } from "../runtime/command-arguments.js";
 import { repositoryIdentityLocation, repositoryName } from "../engine/catalog/repository-identity.js";
 import { followsGitignore, listRepositories, lookupCheckout } from "../engine/catalog/repository-registry.js";
 import { nativeGitAccess } from "../engine/native/git-access.js";
