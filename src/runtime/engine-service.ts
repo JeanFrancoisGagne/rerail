@@ -20,7 +20,7 @@ import {
   SteerReceiptSchema,
   type SteerReceipt,
 } from "./event-protocol.js";
-import { defaultRerailDatabasePath, failWhileWriteLocked, openRerailDatabase, type RerailDatabase } from "../engine/storage/database.js";
+import { defaultRerailDatabasePath, failWhileWriteLocked, type RerailDatabase } from "../engine/storage/database.js";
 import { isBusy } from "../engine/storage/sqlite-wal.js";
 import { waitForWriteLock } from "../engine/storage/write-lock-wait.js";
 import { openRecordWriter, type RecordWriter } from "../engine/storage/record-writes.js";
@@ -29,7 +29,7 @@ import { ENGINE_CHALLENGE_HEADER, ENGINE_PROOF_PATH, engineHoldsCapability, engi
 import { isNamedPipe } from "./daemon/engine-pipe.js";
 import { KeptRuntimes } from "./memory/kept-runtimes.js";
 import { memoryRoom } from "./memory/memory-room.js";
-import { checkoutStatus } from "./repository-start.js";
+import { checkoutStatus, readStartStates } from "./repository-start.js";
 import { nativeTreeWatch, type TreeWatch } from "../engine/code-rule/tree-watch.js";
 import { RepositoryWorktreeWalks } from "../engine/code-rule/worktree-walks.js";
 import { NO_UNTAKEN_EVENTS, untakenEventTaker, type UntakenEventTaker, type UntakenPass } from "../engine/storage/untaken-events.js";
@@ -734,7 +734,7 @@ async function sweepSessions(state: EngineRoutingState, idleMs: number, now: () 
 async function endUnopenableSessions(state: EngineRoutingState): Promise<void> {
   const ending: Array<{ entry: SuspendedEntry; reason: string }> = [];
   for (const [databasePath, entries] of byDatabase([...state.suspended.values()])) {
-    readingStartStates(databasePath, (database) => {
+    readStartStates(databasePath, QUIET_SESSIONS_READ, (database) => {
       for (const entry of entries) {
         const reason = unopenable(entry, database);
         if (reason !== undefined) ending.push({ entry, reason });
@@ -763,19 +763,11 @@ function unopenable(entry: SuspendedEntry, database: RerailDatabase): string | u
   return `Rerail is stopped in ${startGate.checkoutPath}`;
 }
 
-/** `read` over a read-only connection to `databasePath`; a failure is reported and reads as undefined. */
-function readingStartStates<T>(databasePath: string, read: (database: RerailDatabase) => T): T | undefined {
-  let database: RerailDatabase | undefined;
-  try {
-    database = openRerailDatabase(databasePath, { readonly: true });
-    return read(database);
-  } catch (error) {
-    process.stderr.write(`rerail: reading where quiet sessions' checkouts are started failed: ${error instanceof Error ? error.message : String(error)}\n`);
-    return undefined;
-  } finally {
-    database?.$client.close();
-  }
-}
+/**
+ * How the sweep and an open read where quiet sessions' checkouts are started (`readStartStates`): a read that fails is
+ * reported and gives no reason, so no session ends for it.
+ */
+const QUIET_SESSIONS_READ = { onFailure: "log", reading: "where quiet sessions' checkouts are started", unknown: undefined } as const;
 
 /**
  * Keeps a suspended session, with how to make its runtime again, for its next open. Its runtime keeps it as the close
@@ -819,7 +811,7 @@ async function resumeSuspended(state: EngineRoutingState, sessionId: string, now
  */
 async function resumeInLane(state: EngineRoutingState, sessionId: string, entry: SuspendedEntry, now: () => number): Promise<void> {
   if (state.suspended.get(sessionId) !== entry) return;
-  const reason = readingStartStates(entry.suspension.databasePath, database => unopenable(entry, database));
+  const reason = readStartStates(entry.suspension.databasePath, QUIET_SESSIONS_READ, database => unopenable(entry, database));
   if (reason === undefined) await openSuspended(state, sessionId, entry, now);
   else endUnopened(state, entry, reason);
 }

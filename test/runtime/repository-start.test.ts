@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   defaultRerailDatabasePath,
   openRerailDatabase,
@@ -21,6 +21,7 @@ import {
   DAEMON_KEEPS_RUNNING,
   isRerailStarted,
   readOnlyStartState,
+  readStartStates,
   RepositoryStartWatch,
   sessionNoteRules,
   startStateReader,
@@ -501,6 +502,40 @@ describe("repository start state", () => {
       creator.exec("COMMIT");
     } finally {
       creator.close();
+    }
+  });
+
+  it("reads no database as nothing recorded, and one that cannot be opened as each reader must: a command fails, the status line cannot say, the note says not set up", async () => {
+    const root = await temporary("rerail-unreadable-");
+    const checkout = gitRepository(join(root, "acme-api"));
+    const databasePath = join(root, "rerail.sqlite");
+    const refreshed = () => ({ statusLine: readOnlyStartState(checkout, databasePath), note: sessionNoteRules(checkout, databasePath) });
+    expect({ state: workspaceStartState(checkout, databasePath), setUp: workspaceSetUp(checkout, databasePath), ...refreshed() })
+      .toStrictEqual({ state: "stopped", setUp: false, statusLine: "stopped", note: { setUp: false } });
+    expect(existsSync(databasePath)).toBe(false);
+    // Text, not SQLite: every open refuses it.
+    writeFileSync(databasePath, "not an SQLite database\n".repeat(64));
+    expect(() => workspaceStartState(checkout, databasePath)).toThrow("not an SQLite database");
+    expect(() => isRerailStarted(checkout, databasePath)).toThrow("not an SQLite database");
+    expect(() => workspaceSetUp(checkout, databasePath)).toThrow("not an SQLite database");
+    expect(refreshed()).toStrictEqual({ statusLine: undefined, note: { setUp: false } });
+  });
+
+  it("reports a failed read of where the daemon's quiet sessions are started, no file included, and reads it as nothing known", async () => {
+    const root = await temporary("rerail-unreadable-log-");
+    const databasePath = join(root, "rerail.sqlite");
+    const policy = { onFailure: "log", reading: "where quiet sessions' checkouts are started", unknown: undefined } as const;
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const missing = readStartStates(databasePath, policy, () => "read");
+      writeFileSync(databasePath, "not an SQLite database\n".repeat(64));
+      expect({ missing, unreadable: readStartStates(databasePath, policy, () => "read") }).toStrictEqual({ missing: undefined, unreadable: undefined });
+      expect(stderr.mock.calls.map(([line]) => String(line))).toStrictEqual([
+        expect.stringMatching(/^rerail: reading where quiet sessions' checkouts are started failed: .+\n$/u),
+        expect.stringMatching(/^rerail: reading where quiet sessions' checkouts are started failed: .*not an SQLite database.*\n$/u),
+      ]);
+    } finally {
+      stderr.mockRestore();
     }
   });
 });

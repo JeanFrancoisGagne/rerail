@@ -51,18 +51,73 @@ function hasStartTables(database: Pick<RerailDatabase, "$client">): boolean {
 }
 
 /**
+ * What a read of start states answers where the database cannot say, by the kind of reader:
+ * - `throw`, a command's read: a database not there yet (no file, or a schema its creator has not committed) has
+ *   recorded nothing, `unrecorded`; one that cannot be opened or read throws, and the command says why.
+ * - `unknown`, a reader that refreshes often and must not fail (the status line, `/rerail`, the session-start note):
+ *   no file has recorded nothing, `unrecorded`; a schema not committed yet, or a file that cannot be opened, reads as
+ *   `unknown`. A read that fails once the file is open throws, as `throw`'s does.
+ * - `log`, the daemon's read for its quiet sessions: `read` runs with no check before it, and any failure, a missing
+ *   file or table included, is written to stderr, naming what was being read (`reading`), and reads as `unknown`.
+ */
+type FailedStartRead<T> =
+  | { readonly onFailure: "throw"; readonly unrecorded: T }
+  | { readonly onFailure: "unknown"; readonly unrecorded: T; readonly unknown: T }
+  | { readonly onFailure: "log"; readonly reading: string; readonly unknown: T };
+
+/**
+ * `read` over a read-only connection to `databasePath` of its own, closed once `read` returns; where the database
+ * cannot say, what `policy` answers. Creates nothing: no database, schema or identity file.
+ */
+export function readStartStates<T>(databasePath: string, policy: FailedStartRead<T>, read: (database: RerailDatabase) => T): T {
+  if (policy.onFailure === "log") return readLoggingFailure(databasePath, policy, read);
+  if (!existsSync(databasePath)) return policy.unrecorded;
+  let database: RerailDatabase;
+  try {
+    database = openRerailDatabase(databasePath, { readonly: true });
+  } catch (error) {
+    if (policy.onFailure === "throw") throw error;
+    return policy.unknown;
+  }
+  try {
+    return hasStartTables(database) ? read(database) : withoutSchema(policy);
+  } finally {
+    database.$client.close();
+  }
+}
+
+/** What `policy` answers for a database whose creator has not committed the schema yet. */
+function withoutSchema<T>(policy: Exclude<FailedStartRead<T>, { onFailure: "log" }>): T {
+  return policy.onFailure === "unknown" ? policy.unknown : policy.unrecorded;
+}
+
+/** {@link readStartStates} under the `log` policy. */
+function readLoggingFailure<T>(databasePath: string, policy: Extract<FailedStartRead<T>, { onFailure: "log" }>, read: (database: RerailDatabase) => T): T {
+  let database: RerailDatabase | undefined;
+  try {
+    database = openRerailDatabase(databasePath, { readonly: true });
+    return read(database);
+  } catch (error) {
+    process.stderr.write(`rerail: reading ${policy.reading} failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    return policy.unknown;
+  } finally {
+    database?.$client.close();
+  }
+}
+
+/** A command's read of a checkout's status: a database not there yet has recorded nothing, so the checkout is stopped. */
+const COMMAND_READ: FailedStartRead<RepositoryStatus> = { onFailure: "throw", unrecorded: STOPPED };
+
+/** The status of the checkout `workspace` is in, as `database` records it. */
+const statusIn = (workspace: string) => (database: RerailDatabase): RepositoryStatus =>
+  checkoutStatus(database, lookupCheckout(database, workspace));
+
+/**
  * `workspace`'s start state without side effects: no identity file, database, or schema is created and nothing
  * is recorded. A database another process is still creating has recorded nothing yet, so it reads stopped.
  */
 export function workspaceStartState(workspace: string, databasePath = defaultRerailDatabasePath()): RepositoryStartState {
-  if (!existsSync(databasePath)) return stateOf(STOPPED);
-  const database = openRerailDatabase(databasePath, { readonly: true });
-  try {
-    if (!hasStartTables(database)) return stateOf(STOPPED);
-    return stateOf(checkoutStatus(database, lookupCheckout(database, workspace)));
-  } finally {
-    database.$client.close();
-  }
+  return stateOf(readStartStates(databasePath, COMMAND_READ, statusIn(workspace)));
 }
 
 /**
@@ -70,41 +125,25 @@ export function workspaceStartState(workspace: string, databasePath = defaultRer
  * Rerail never recorded is not set up.
  */
 export function workspaceSetUp(workspace: string, databasePath = defaultRerailDatabasePath()): boolean {
-  if (!existsSync(databasePath)) return false;
-  const database = openRerailDatabase(databasePath, { readonly: true });
-  try {
-    return hasStartTables(database) && checkoutStatus(database, lookupCheckout(database, workspace)).setUp;
-  } finally {
-    database.$client.close();
-  }
+  return readStartStates(databasePath, COMMAND_READ, statusIn(workspace)).setUp;
 }
+
+/** The status line's read: a database that cannot be opened, or whose schema is not committed yet, cannot say. */
+const REFRESHED_READ: FailedStartRead<RepositoryStatus | undefined> = { onFailure: "unknown", unrecorded: STOPPED, unknown: undefined };
 
 /**
  * `workspaceStartState` for readers that refresh often and must never fail on a database they cannot read
  * (the status line, `/rerail`): undefined where the database cannot be opened or has no schema yet.
  */
 export function readOnlyStartState(workspace: string, databasePath = defaultRerailDatabasePath()): RepositoryStartState | undefined {
-  if (!existsSync(databasePath)) return stateOf(STOPPED);
-  return readOnly(databasePath, database =>
-    hasStartTables(database) ? stateOf(checkoutStatus(database, lookupCheckout(database, workspace))) : undefined);
-}
-
-/** `read` over a read-only connection; undefined when the database cannot be opened or read. */
-function readOnly<T>(databasePath: string, read: (database: RerailDatabase) => T): T | undefined {
-  let database: RerailDatabase;
-  try {
-    database = openRerailDatabase(databasePath, { readonly: true });
-  } catch {
-    return undefined;
-  }
-  try {
-    return read(database);
-  } finally {
-    database.$client.close();
-  }
+  const status = readStartStates(databasePath, REFRESHED_READ, statusIn(workspace));
+  return status === undefined ? undefined : stateOf(status);
 }
 
 const NOT_SET_UP: SessionNoteRules = { setUp: false };
+
+/** The session-start note's read: a repository whose database cannot say is not set up, as far as the note tells. */
+const NOTE_READ: FailedStartRead<SessionNoteRules> = { onFailure: "unknown", unrecorded: NOT_SET_UP, unknown: NOT_SET_UP };
 
 /**
  * What the session-start note says about `workspace`'s rules: how many are on in the checkout once its repository
@@ -112,13 +151,11 @@ const NOT_SET_UP: SessionNoteRules = { setUp: false };
  * Rerail is started, so the start state is not read again here.
  */
 export function sessionNoteRules(workspace: string, databasePath = defaultRerailDatabasePath()): SessionNoteRules {
-  if (!existsSync(databasePath)) return NOT_SET_UP;
-  return readOnly(databasePath, database => {
-    if (!hasStartTables(database)) return NOT_SET_UP;
+  return readStartStates(databasePath, NOTE_READ, database => {
     const checkout = lookupCheckout(database, workspace);
     if (checkout === undefined || !checkoutStatus(database, checkout).setUp) return NOT_SET_UP;
     return { setUp: true, ruleCount: onRuleCount(database, checkout) } satisfies SessionNoteRules;
-  }) ?? NOT_SET_UP;
+  });
 }
 
 /**
