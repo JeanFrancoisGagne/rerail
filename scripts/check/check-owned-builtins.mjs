@@ -314,6 +314,10 @@ const CHECKS = new Map([
   [ts.SyntaxKind.VariableStatement, ["checkExportedVariables"]],
   [ts.SyntaxKind.CallExpression, ["checkProgram", "checkCall"]],
 ]);
+/** The checks that report only rules with names, which a walk under none of them, as over test/, leaves out. */
+const NAMED_ONLY = new Set(["checkBindings", "checkMember", "checkLocalExport", "checkExportAssignment", "checkExportedVariables"]);
+const UNNAMED_CHECKS = new Map([...CHECKS].map(([kind, names]) => [kind, names.filter(name => !NAMED_ONLY.has(name))]));
+const NO_CHECKS = [];
 
 /** A file's walk: what each local name reaches inside a watched module, and every finding. */
 class Walk {
@@ -322,11 +326,14 @@ class Walk {
     /** The rules on reaching a module or a name; {@link callRules} are on the calls of a name. */
     this.rules = rules.filter(rule => rule.call === undefined);
     this.callRules = rules.filter(rule => rule.call !== undefined);
+    this.checks = this.rules.some(rule => rule.names !== undefined) ? CHECKS : UNNAMED_CHECKS;
     this.modules = new Set(rules.flatMap(rule => rule.modules));
     /** @type {Map<string, { module: string, path: string[] }>} */
     this.bindings = new Map();
     /** @type {Map<string, { line: number, rule: string, message: string }>} */
     this.found = new Map();
+    /** Whether a string in the file names a watched module, which {@link bind} reads. */
+    this.named = false;
   }
 
   report(at, rule, message = rule.message, id = rule.id) {
@@ -379,15 +386,22 @@ class Walk {
   }
 
   /**
-   * Records every binding to a watched module before {@link check} reads a use, so a use above its binding resolves.
-   * The walk repeats until it adds none: an alias written above the binding it copies (`const n = m` in a function
-   * above `const m = require(...)`) is bound only on the second pass, and a use written above the alias needs it.
+   * Records every binding to a watched module before {@link check} reads a use, so a use above its binding resolves,
+   * and whether the file names a watched module at all (`named`): every reach starts at a string that names one. The
+   * first pass reads every node; the next read the declarations it found, until one adds no binding: an alias written
+   * above the binding it copies (`const n = m` in a function above `const m = require(...)`) is bound only on the
+   * second pass, and a use written above the alias needs it.
    */
   bind() {
+    const declarations = [];
+    eachNode(this.source, (node) => {
+      this.named ||= this.namesModule(node);
+      if (ts.isVariableDeclaration(node) || isImport(node)) declarations.push(node);
+    });
     const ignore = () => {};
     for (let size = -1; size !== this.bindings.size;) {
       size = this.bindings.size;
-      eachNode(this.source, node => this.bindDeclaration(node, ignore));
+      for (const node of declarations) this.bindDeclaration(node, ignore);
     }
   }
 
@@ -433,10 +447,15 @@ class Walk {
     if (key !== undefined) this.bindPattern(element.name, within(reach, key), visit);
   }
 
-  /** Reports every finding in the file, after {@link bind}: each node gets the checks {@link CHECKS} lists for its kind. */
+  /**
+   * Reports every finding in the file, after {@link bind}: each node gets the checks {@link CHECKS} lists for its kind,
+   * less those {@link NAMED_ONLY} names when no rule has names. A file that names no watched module reaches none, so
+   * only a program-path rule has anything to find in it.
+   */
   check() {
+    if (!this.named && !this.rules.some(rule => rule.programPath === true)) return;
     eachNode(this.source, (node) => {
-      for (const name of CHECKS.get(node.kind) ?? []) this[name](node);
+      for (const name of this.checks.get(node.kind) ?? NO_CHECKS) this[name](node);
     });
   }
 
