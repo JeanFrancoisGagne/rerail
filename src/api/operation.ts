@@ -18,6 +18,7 @@ import type { MergeAssistService } from "../runtime/merge-assist/service.js";
 import type { ChangeFeed } from "./change-feed.js";
 import { InvalidCursorError } from "../engine/storage/page-cursor.js";
 import { experimentEnabled, experimentOffMessage, experimentVariable, type ExperimentalFeature } from "../engine/experimental-features.js";
+import { inOneRequest } from "./request-stores.js";
 
 export interface RerailApiStores {
   /** Read-only view; tolerates a database that does not exist yet. */
@@ -160,7 +161,8 @@ async function answerOnDisk(operation: Operation, stores: RerailApiStores, input
  * once the log holding it is on the disk: a rule or setting change a person made must not roll back after a power cut
  * once its caller heard it succeeded. A history write that waits in the record writer while another process holds the
  * lock (`openRecordWriter`) commits after the answer, and the background sync takes it to the disk
- * (`startHistorySync`). The sync runs off the daemon's thread, so no hook waits for it.
+ * (`startHistorySync`). The sync runs off the daemon's thread, so no hook waits for it. The handler reads through
+ * stores that serve this one call ({@link inOneRequest}).
  */
 export async function invokeOperation(operation: Operation, stores: RerailApiStores, input: Record<string, unknown>, caller: ApiCaller): Promise<unknown> {
   // Refused before anything runs, and before a write could count toward the change token.
@@ -168,7 +170,7 @@ export async function invokeOperation(operation: Operation, stores: RerailApiSto
     throw new ApiError(404, "experimental-off", experimentOffMessage(operation.experiment, "start the Rerail daemon with"));
   }
   try {
-    return await answerOnDisk(operation, stores, input, caller);
+    return await inOneRequest(stores, operation.method, request => answerOnDisk(operation, request, input, caller));
   } catch (error) {
     if (error instanceof InvalidCursorError) throw new ApiError(400, "invalid-cursor", error.message);
     throw error;

@@ -26,6 +26,7 @@ import { eventRecordSchema, auditRecordSchema, presentationPreferenceSchema } fr
 import { deciderSchema, effectiveRuleSchema, libraryRuleRecordSchema, repositorySummarySchema } from "./repository-contracts.js";
 import { checkoutAt, checkoutRuleCatalog } from "./repository-operations.js";
 import { mountChangeStream } from "./change-stream.js";
+import { inOneRequest } from "./request-stores.js";
 import { sessionResponseSchema, sessionSummarySchema } from "./session-contracts.js";
 
 // Named components give the generated client stable type names, and break the recursive
@@ -309,7 +310,9 @@ export function createRerailApi(
           + "or not-on-disk: the write was made but could not be confirmed on the disk"),
       },
     });
-    app.openapi(route, async (context: Context) => {
+    // The tag check and the handler read through the same stores of this one request, so what the tag looked up (the
+    // checkout, the rule catalog) the handler does not look up again.
+    app.openapi(route, (context: Context) => inOneRequest(stores, operation.method, async stores => {
       const validated = context.req as unknown as { valid(target: "param" | "query" | "json"): Record<string, unknown> | undefined };
       const input = { ...validated.valid("param"), ...validated.valid("query"), ...validated.valid("json") };
       const conditional = (etag: string): Response | undefined => {
@@ -350,7 +353,7 @@ export function createRerailApi(
         if (error instanceof ApiError) return context.json({ error: error.code, message: error.message }, error.status as 400);
         throw error;
       }
-    });
+    }));
   }
 
   app.doc31("/openapi.json", {
