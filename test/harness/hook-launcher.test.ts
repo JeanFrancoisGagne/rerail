@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { HOOK_COMPILE_CACHE_DIR } from "../../src/engine/index.js";
 import { removeFolder } from "../support/platform/remove-folder.js";
 
 const LAUNCHER = resolve(import.meta.dirname, "../../src/harness/hook-launcher.ts");
@@ -157,15 +158,38 @@ interface CachePlace {
   hook: string;
 }
 
-/** A folder for one test: the cache reporting hook, the recorded node and a temporary folder (`tmp`) of its own. */
+/**
+ * The hook as set-up registers it: an entry that turns the compile cache on and loads the hook's bundle beside it, here
+ * the cache reporting hook (`bundle/claude-hook.mjs`).
+ */
+const CACHE_REPORTING_ENTRY = [
+  `import { loadHook } from ${JSON.stringify(pathToFileURL(resolve(import.meta.dirname, "../../src/harness/hook-entry.ts")).href)};`,
+  'await loadHook(import.meta.url, "./bundle/claude-hook.mjs");',
+].join("\n");
+
+/**
+ * Where the hook's entry keeps its compiled code by default: Node's own folder in the temporary folder on Windows, a
+ * folder in the Rerail home elsewhere, whose temporary folder other accounts share.
+ */
+function defaultCacheFolder(base: string): string {
+  return WINDOWS ? join(base, "tmp", "node-compile-cache") : join(base, "rerail-home", HOOK_COMPILE_CACHE_DIR);
+}
+
+/**
+ * A folder for one test: the hook's entry and the cache reporting bundle, the recorded node, and a temporary folder
+ * (`tmp`) and Rerail home (`rerail-home`) of its own.
+ */
 async function cachePlace(recorded: "runs" | "itself"): Promise<CachePlace> {
   const base = await mkdtemp(join(tmpdir(), "rerail-hook-launcher-"));
   temporaryDirectories.push(base);
   const hook = join(base, "claude-hook.mjs");
-  await writeFile(hook, CACHE_REPORTING_HOOK);
+  await writeFile(hook, CACHE_REPORTING_ENTRY);
+  await mkdir(join(base, "bundle"));
+  await writeFile(join(base, "bundle", "claude-hook.mjs"), CACHE_REPORTING_HOOK);
   const node = recorded === "itself" ? process.execPath : join(base, RECORDED_NODE);
   if (recorded === "runs") await recordedNode(node);
   await mkdir(join(base, "tmp"));
+  await mkdir(join(base, "rerail-home"));
   return { base, node, hook };
 }
 
@@ -179,9 +203,9 @@ interface Launched {
 }
 
 /**
- * The launcher started as Claude Code starts a hook, with the place's temporary folder (where Node keeps its compile
- * cache by default) and none of the caller's compile cache settings; `env` adds to that environment, and `preload` is a
- * module the node that starts the launcher loads first.
+ * The launcher started as Claude Code starts a hook, with the place's temporary folder and Rerail home (where the
+ * hook's compile cache goes by default) and none of the caller's compile cache settings; `env` adds to that environment,
+ * and `preload` is a module the node that starts the launcher loads first.
  */
 function launchAt(place: CachePlace, env: NodeJS.ProcessEnv = {}, preload?: string): Launched {
   const temp = join(place.base, "tmp");
@@ -190,7 +214,7 @@ function launchAt(place: CachePlace, env: NodeJS.ProcessEnv = {}, preload?: stri
   const result = spawnSync(process.execPath, ["--import", "tsx", ...imports, LAUNCHER, place.node, place.hook], {
     input: "{}",
     encoding: "utf8",
-    env: { ...caller, TMPDIR: temp, TMP: temp, TEMP: temp, ...env },
+    env: { ...caller, TMPDIR: temp, TMP: temp, TEMP: temp, RERAIL_HOME: join(place.base, "rerail-home"), ...env },
   });
   const answer = JSON.parse(result.stdout || "{}") as Launched["answer"];
   return { status: result.status, answer, cache: answer.cache ?? null, named: answer.named ?? null, stderr: result.stderr };
@@ -209,7 +233,7 @@ describe("hook launcher and Node's compile cache", () => {
   it.each<"runs" | "itself">(["itself", "runs"])("runs the hook with Node's compile cache on, in its default folder (recorded node %s)", async recorded => {
     const { cache, base, stderr } = await launchForCache(recorded);
     expect(cache, stderr).not.toBeNull();
-    expect(dirname(await realpath(cache ?? ""))).toBe(await realpath(join(base, "tmp", "node-compile-cache")));
+    expect(dirname(await realpath(cache ?? ""))).toBe(await realpath(defaultCacheFolder(base)));
   }, 30_000);
 
   it.each<"runs" | "itself">(["itself", "runs"])("keeps the cache in the folder the person named in NODE_COMPILE_CACHE (recorded node %s)", async recorded => {

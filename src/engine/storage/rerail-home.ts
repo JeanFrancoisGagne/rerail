@@ -31,6 +31,11 @@ export const VERSIONS_DIR = "versions";
 export const CURRENT_LINK = "current";
 /** In the Rerail home: the folder holding the launcher. */
 export const LAUNCHER_DIR = "bin";
+/**
+ * In the Rerail home, on macOS and Linux: Node's compile cache for the hooks, the code V8 compiled for a hook's bundle
+ * at an earlier event (`src/harness/hook-entry.ts`). Windows keeps it in the person's temporary folder.
+ */
+export const HOOK_COMPILE_CACHE_DIR = "hook-compile-cache";
 
 /** Internal testing: the remote sink's files in the Rerail home (runtime/remote-config.ts and remote-outbox.ts write them). */
 export const REMOTE_CONFIG_FILE = "remote.json";

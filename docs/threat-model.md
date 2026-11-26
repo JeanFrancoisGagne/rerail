@@ -387,6 +387,11 @@ Rerail's files are private to the person's OS user: folders 0700, files 0600 (ex
   secrets redacted and a tool's output left out) waits in `untaken-events/` in the home, 0700 with files 0600, until
   the daemon takes it (`src/engine/storage/untaken-events.ts`). A process that can write there can already read
   `daemon.json`'s capability and send events itself.
+- The code Node compiled for a hook's bundle (its compile cache) is kept, on macOS and Linux, in `hook-compile-cache/`
+  in the home, made 0700, never in the temporary folder other accounts share: compiled code read from a folder another
+  account can write is code that account chose. A hook runs without the cache where that folder is a link, another
+  user's or open to others, and makes no home (`src/harness/hook-entry.ts`). On Windows it is Node's
+  `node-compile-cache` in the person's temporary folder; `NODE_COMPILE_CACHE` names another folder, the person's choice.
 - Windows ignores modes. A Rerail home or `.rerail\sessions` folder made outside the profile folder, whose ACL would
   let every local user read it, gets a protected ACL granting the person, SYSTEM and Administrators alone, which
   everything written in it inherits; a home an earlier release made gets it at the next daemon launch, and a

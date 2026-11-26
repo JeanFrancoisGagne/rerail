@@ -23,7 +23,7 @@ import { ENTRY_POINTS } from "../engine/package-root.js";
 import { RULES_DUMP_FILE } from "../engine/catalog/rule-bootstrap.js";
 import { INSTALLED_PACKS_DIR, installedPacksPrefix, loadRuleCatalog, packsWithRulesNotRun } from "../engine/catalog/rule-catalog.js";
 import { PACK_COMPILE_CHECKS_FILE } from "../engine/catalog/pack-compile-checks.js";
-import { MACHINE_ID_FILE, REMOTE_CONFIG_FILE, REMOTE_OUTBOX_FILE, REMOTE_TOKENS_FOLDER, STATUS_LINES_FOLDER } from "../engine/storage/rerail-home.js";
+import { HOOK_COMPILE_CACHE_DIR, MACHINE_ID_FILE, REMOTE_CONFIG_FILE, REMOTE_OUTBOX_FILE, REMOTE_TOKENS_FOLDER, STATUS_LINES_FOLDER } from "../engine/storage/rerail-home.js";
 import { MAIN_INSTANCE_HOLDER_FILE } from "../engine/native/main-instance.js";
 import { LOCKS_DIR } from "../engine/native/file-lock.js";
 import { UNTAKEN_EVENTS_DIR } from "../engine/storage/untaken-events.js";
@@ -479,8 +479,8 @@ export const CONSENT_FILE = "consent.json";
 /**
  * What Rerail itself writes in its home, by the name its writer gives it: settings, records, locks, `rerail activate`'s
  * profiles and device secrets, `rules export`'s dump, the pack verdicts a catalog read keeps, the remote sink's
- * configuration, tokens and machine id, and the installation. A name a writer puts in the home and this list lacks is
- * taken for someone else's file, so `--delete-data` keeps it and the home.
+ * configuration, tokens and machine id, the installation and the hooks' compile cache. A name a writer puts in the
+ * home and this list lacks is taken for someone else's file, so `--delete-data` keeps it and the home.
  */
 const RERAIL_HOME_ENTRIES: readonly string[] = [
   CONSENT_FILE,
@@ -509,6 +509,7 @@ const RERAIL_HOME_ENTRIES: readonly string[] = [
   VERSIONS_DIR,
   CURRENT_LINK,
   LAUNCHER_DIR,
+  HOOK_COMPILE_CACHE_DIR,
   SCRUB_HINT_FILE,
 ];
 

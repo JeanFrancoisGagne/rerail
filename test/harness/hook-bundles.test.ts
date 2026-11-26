@@ -13,6 +13,10 @@ describe("the hook bundles", () => {
     { script: "build:claude", entry: "src/hosts/claude/claude-hook.ts" },
     { script: "build:codex", entry: "src/hosts/codex/codex-hook.ts" },
     { script: "build:cursor", entry: "src/hosts/cursor/cursor-hook.ts" },
+    // The file set-up registers, which turns the compile cache on and then loads the bundle above.
+    { script: "build:claude", entry: "src/hosts/claude/claude-hook-entry.ts" },
+    { script: "build:codex", entry: "src/hosts/codex/codex-hook-entry.ts" },
+    { script: "build:cursor", entry: "src/hosts/cursor/cursor-hook-entry.ts" },
   ])("hold nothing an older Node cannot parse: $entry", async ({ script, entry }) => {
     expect(await linesRewrittenForOlderNode(await scriptBundleOptions(script, entry, "."))).toEqual([]);
   }, 60_000);

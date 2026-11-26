@@ -1,0 +1,1 @@
+On macOS and Linux, and for Codex and Cursor on Windows, a hook call starts sooner after the first one: each hook turns on Node's compile cache, so it reuses the code Node compiled for an earlier call. On macOS and Linux the cache is in `hook-compile-cache` in the Rerail home. `NODE_DISABLE_COMPILE_CACHE=1` keeps it off.
