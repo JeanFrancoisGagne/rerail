@@ -21,6 +21,7 @@ interface NativeSessionEndpoint {
   tlsFingerprint256?: string;
 }
 
+/** How soon a poll follows activation or an outage's end, and the last one on a daemon that holds no `await-deliveries`. */
 const POLL_INTERVAL_MS = 100;
 const POLL_BACKOFF_CEILING_MS = 5_000;
 /** Cheap polls cover a blip; from here on the host rebuilds the session, which re-resolves the daemon. */
@@ -73,6 +74,8 @@ export interface NativeSessionReply {
   entries: Array<{ customType: string; data: unknown }>;
   /** The daemon is still working on the operation; its reply is asked for again with this ticket. */
   pendingReply?: string;
+  /** On a poll's answer: the daemon holds an `await-deliveries` until the session has deliveries; an older one says nothing. */
+  waitForDeliveries?: boolean;
 }
 
 export interface NativeSessionClientOptions {
@@ -208,6 +211,13 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
   #active = false;
   #closing = false;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * The `await-deliveries` the daemon holds for this session, aborted when this runtime closes. An outage leaves it: if it
+   * ends meanwhile, its poll meets the shut stream, and the poll that ends the outage asks again when none is held.
+   */
+  #waiting: AbortController | undefined;
+  /** The last poll's answer said the daemon holds an `await-deliveries`, so the next ask waits there instead of on a timer. */
+  #daemonHolds = false;
   #outage: Outage | undefined;
   /** Events dropped during the current outage, for its recovery line. */
   #dropped = 0;
@@ -270,6 +280,7 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
   close(): Promise<unknown> {
     this.#closing = true;
     clearTimeout(this.#timer);
+    this.#stopWaiting();
     // The footer stops showing an open gap with this runtime, and a retiring runtime reports nothing more to it:
     // the footer belongs to whichever runtime replaces this one.
     if (this.#gap !== undefined) this.#options.reportDropped?.(0);
@@ -346,7 +357,38 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
 
   /** Background delivery; a failure hands over to the outage breaker, which resumes the loop. */
   #poll(): void {
-    void this.#request("poll").then(() => this.#schedulePoll(), () => undefined);
+    void this.#request("poll").then(() => this.#afterPoll(), () => undefined);
+  }
+
+  /** The next ask: held by a daemon that says it holds one, else a poll after the interval, as an older daemon needs. */
+  #afterPoll(): void {
+    if (this.#daemonHolds) this.#awaitDeliveries();
+    else this.#schedulePoll();
+  }
+
+  /**
+   * Asks the daemon to answer once the session has deliveries, so an idle session asks nothing while nothing happens.
+   * The daemon holds the ask until then, until the session or the daemon closes, or until this runtime stops waiting;
+   * whatever ends it, one poll follows, and that poll's own outcome decides what comes next (the outage breaker takes a
+   * failed one). It has no time limit of its own: only the transport's (`fetch` gives up on an answer whose headers have
+   * not come after 300 s; nothing else can tell a daemon that stopped answering on an open connection).
+   */
+  #awaitDeliveries(): void {
+    clearTimeout(this.#timer);
+    if (this.#closing || this.#waiting !== undefined) return;
+    const waiting = new AbortController();
+    this.#waiting = waiting;
+    const ended = (): void => {
+      if (this.#waiting !== waiting) return;
+      this.#waiting = undefined;
+      this.#poll();
+    };
+    void this.#post({ operation: "await-deliveries" }, waiting.signal).then(ended, ended);
+  }
+
+  #stopWaiting(): void {
+    this.#waiting?.abort();
+    this.#waiting = undefined;
   }
 
   /**
@@ -502,7 +544,7 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
     } catch (error) {
       return this.#failedSend(operation, streamed, event, error);
     }
-    this.#noteSent(operation, streamed);
+    this.#noteSent(operation, streamed, reply);
     return await this.#settledReply(reply);
   }
 
@@ -539,7 +581,9 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
     return this.#refuseStreamed(operation, event, error);
   }
 
-  #noteSent(operation: StreamedOrExplicitOperation, streamed: boolean): void {
+  #noteSent(operation: StreamedOrExplicitOperation, streamed: boolean, reply: NativeSessionReply): void {
+    // Each poll's answer says it again: a daemon replaced by an older one is polled on the timer again.
+    if (operation === "poll") this.#daemonHolds = reply.waitForDeliveries === true;
     if (operation !== "close") this.#recover();
     if (streamed && this.#unrecorded.length > 0) void this.#recordGaps();
   }
@@ -582,13 +626,13 @@ export class NativeSessionClient implements NativeSemanticToolRuntime {
     return reply;
   }
 
-  async #post(request: Record<string, unknown>): Promise<NativeSessionReply> {
+  async #post(request: Record<string, unknown>, signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS)): Promise<NativeSessionReply> {
     const { instance, sessionId, host } = this.#options;
     const response = await daemonFetch({ ...instance, url: instance.url.href })(new URL("/native/session", instance.url), {
       method: "POST",
       headers: { ...daemonAccessHeaders(instance), "content-type": "application/json", authorization: `Bearer ${this.#options.token}` },
       body: JSON.stringify({ workspaceRoot: instance.workspaceRoot, sessionId, host, ...request }),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal,
     });
     const text = await response.text();
     if (!response.ok) throw new NativeRequestError(response.status, text);

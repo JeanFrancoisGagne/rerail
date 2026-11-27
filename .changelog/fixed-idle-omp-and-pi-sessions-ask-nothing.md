@@ -1,0 +1,1 @@
+An OMP or Pi session left open no longer asks the daemon for its steers ten times a second for as long as it stays open: it waits for the daemon to say it has one, so an idle session costs the daemon far less processor time. A steer still reaches the session as soon as it is found.

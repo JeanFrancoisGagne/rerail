@@ -4,8 +4,10 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { NativeSessionServer } from "../../src/daemon/native-session-server.js";
+import { NativeSessionClient } from "../../src/harness/index.js";
 import { RerailRuntime, SqliteSessionReader } from "../../src/runtime/index.js";
 import { CodeRuleBridge, RepositoryWorktreeWalks, SqliteAuditStore } from "../../src/engine/index.js";
+import { closeNativeTestDaemons, startNativeTestDaemon } from "../support/native-daemon.js";
 import { removeFolder } from "../support/platform/remove-folder.js";
 import { startTestRepository, stopTestRepository } from "../support/started-repository.js";
 
@@ -327,6 +329,93 @@ describe("NativeSessionServer request boundary", () => {
     reader.close();
   });
 
+  it("makes no sweep timer until a session opens, and drops it once no open session can run out of lease", async () => {
+    vi.useFakeTimers();
+    root = await mkdtemp(join(tmpdir(), "rerail-native-server-"));
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    const databasePath = join(root, "rerail.sqlite");
+    startTestRepository(root, databasePath);
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    server = new NativeSessionServer({ workspaceRoot: root, modelPath: resolve("model"), databasePath, sessionLeaseMs: 1_000, sessionSweepIntervalMs: 100 });
+    const sweeps = (): unknown[] => intervals.mock.calls.flatMap((call, index) => (call[1] === 100 ? [intervals.mock.results[index]!.value] : []));
+    expect(sweeps()).toEqual([]);
+
+    const request = { workspaceRoot: root, sessionId: "swept", host: "pi" as const };
+    await server.handle({ ...request, operation: "initialize", entries: [], input: { cwd: root, rules: [] } });
+    expect(sweeps()).toHaveLength(1);
+    await server.handle({ ...request, operation: "close" });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(cleared).toHaveBeenCalledWith(sweeps()[0]);
+    expect(sweeps()).toHaveLength(1);
+  });
+
+  it("answers a new session's first ask for deliveries at once, holds the next after a poll whatever the time, and answers it when the session closes", async () => {
+    vi.useFakeTimers();
+    root = await mkdtemp(join(tmpdir(), "rerail-native-server-"));
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    const databasePath = join(root, "rerail.sqlite");
+    startTestRepository(root, databasePath);
+    server = new NativeSessionServer({ workspaceRoot: root, modelPath: resolve("model"), databasePath });
+    const request = { workspaceRoot: root, sessionId: "asking", host: "pi" as const };
+    await server.handle({ ...request, operation: "initialize", entries: [], input: { cwd: root, rules: [] } });
+
+    await expect(server.handle({ ...request, operation: "await-deliveries" })).resolves.toEqual({ deliveries: [], entries: [] });
+    await expect(server.handle({ ...request, operation: "poll" })).resolves.toMatchObject({ deliveries: [], waitForDeliveries: true });
+    let answered = false;
+    const asking = server.handle({ ...request, operation: "await-deliveries" }).then((reply) => {
+      answered = true;
+      return reply;
+    });
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(answered).toBe(false);
+
+    await server.handle({ ...request, operation: "close" });
+    await expect(asking).resolves.toEqual({ deliveries: [], entries: [] });
+  });
+
+  it("keeps a session whose ask is held past its lease, and retires it a lease after the ask's client goes away", async () => {
+    vi.useFakeTimers();
+    root = await mkdtemp(join(tmpdir(), "rerail-native-server-"));
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    const databasePath = join(root, "rerail.sqlite");
+    startTestRepository(root, databasePath);
+    server = new NativeSessionServer({ workspaceRoot: root, modelPath: resolve("model"), databasePath, sessionLeaseMs: 1_000, sessionSweepIntervalMs: 100 });
+    const request = { workspaceRoot: root, sessionId: "held", host: "pi" as const };
+    // A session beside it that holds no ask keeps the sweep going, and runs out of lease as an abandoned one does.
+    const beside = { ...request, sessionId: "beside" };
+    await server.handle({ ...request, operation: "initialize", entries: [], input: { cwd: root, rules: [] } });
+    await server.handle({ ...beside, operation: "initialize", entries: [], input: { cwd: root, rules: [] } });
+    await server.handle({ ...request, operation: "poll" });
+    // As the daemon's route calls it: with the signal the request's connection ends.
+    const route: (input: unknown, signal?: AbortSignal) => Promise<unknown> = server.handle.bind(server);
+    const connection = new AbortController();
+    const asking = route({ ...request, operation: "await-deliveries" }, connection.signal);
+    const ended = (sessionId: string): unknown => {
+      const reader = new SqliteSessionReader(databasePath);
+      try {
+        return reader.sessions().find(recorded => recorded.sessionId === sessionId)?.endedAt;
+      } finally {
+        reader.close();
+      }
+    };
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    // In the session's lane, behind the sweep's close: it answers once that close has recorded the session's end.
+    await expect(server.handle({ ...beside, operation: "poll" })).rejects.toThrow("native session is not initialized");
+    expect(ended("beside")).toEqual(expect.any(Number));
+    expect(ended("held")).toBeNull();
+
+    connection.abort();
+    await expect(asking).resolves.toEqual({ deliveries: [], entries: [] });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(ended("held")).toBeNull();
+    await vi.advanceTimersByTimeAsync(200);
+    await expect(server.handle({ ...request, operation: "poll" })).rejects.toThrow("native session is not initialized");
+    expect(ended("held")).toEqual(expect.any(Number));
+  });
+
   it("answers an operation that outlasts the reply bound with a ticket, and collects it, and the one queued behind it, in order", async () => {
     root = await mkdtemp(join(tmpdir(), "rerail-native-server-"));
     vi.stubEnv("RERAIL_HOME", join(root, "home"));
@@ -425,4 +514,133 @@ describe("NativeSessionServer request boundary", () => {
     await server.handle({ ...session, operation: "ingest", event: { kind: "user-prompt", sessionId: "s", eventId: "p", text: "hi" } });
     await vi.waitFor(() => expect(of).toHaveBeenCalledTimes(1), { timeout: 10_000 });
   });
+});
+
+describe("native sessions at rest", () => {
+  const directories: string[] = [];
+
+  afterEach(async () => {
+    await closeNativeTestDaemons();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+    for (const path of directories.splice(0)) await removeFolder(path);
+  });
+
+  it("cost the daemon no request and no timer between two prompts, however far apart, with ten sessions open", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const root = await mkdtemp(join(tmpdir(), "rerail-native-idle-"));
+    directories.push(root);
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    const databasePath = join(root, "rerail.sqlite");
+    startTestRepository(root, databasePath);
+    const server = new NativeSessionServer({ workspaceRoot: root, modelPath: resolve("model"), databasePath });
+    // The daemon's HTTP route, in process: each request reaches the server with its connection's signal.
+    const route: (input: unknown, signal?: AbortSignal) => Promise<unknown> = server.handle.bind(server);
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", async (_url: URL, init: RequestInit) => {
+      const request = z.object({ operation: z.string() }).passthrough().parse(JSON.parse(String(init.body)));
+      asked.push(request.operation);
+      try {
+        return Response.json(await route(request, init.signal ?? undefined));
+      } catch (error) {
+        return Response.json({ error: "native-request-invalid", message: error instanceof Error ? error.message : String(error) }, { status: 400 });
+      }
+    });
+    // The timers the native session client and server make, each told by the frame that made it, as the daemon-cost
+    // measures counted them; a session's runtime keeps timers of its own (its control poll, its walks) on clocks of
+    // their own, which this case does not judge.
+    const makers: string[] = [];
+    const maker = (stack: string): string =>
+      stack.split("\n").slice(1).find(frame => !frame.includes("native-session-server.test.ts") && !frame.includes("node_modules")) ?? "";
+    const timeout = globalThis.setTimeout;
+    const interval = globalThis.setInterval;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      makers.push(maker(new Error().stack ?? ""));
+      return timeout(...args);
+    }) as typeof setTimeout);
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((...args: Parameters<typeof setInterval>) => {
+      makers.push(maker(new Error().stack ?? ""));
+      return interval(...args);
+    }) as typeof setInterval);
+    const made = (): number => makers.filter(frame => /native-session-(?:client|server)|delivery-wait/u.test(frame)).length;
+    const sessionIds = Array.from({ length: 10 }, (_, index) => `idle-${index}`);
+    const clients = sessionIds.map(sessionId => new NativeSessionClient({
+      instance: { workspaceRoot: root, url: new URL("http://127.0.0.1:4737") },
+      token: "native-token",
+      host: "pi", sessionId, entries: () => [],
+      appendEntry() {},
+      deliver() {},
+    }));
+    const tally = (operations: readonly string[]): Record<string, number> =>
+      operations.reduce<Record<string, number>>((counts, operation) => ({ ...counts, [operation]: (counts[operation] ?? 0) + 1 }), {});
+    try {
+      for (const client of clients) {
+        await client.initialize({ cwd: root, modelPath: resolve("model"), rules: [] });
+        await client.activate();
+      }
+      await vi.advanceTimersByTimeAsync(1_000);
+      /** What the ten sessions cost the daemon from one prompt each to the next, `apart` ms later. */
+      const fromPromptToNext = async (round: string, apart: number): Promise<{ requests: Record<string, number>; timers: number }> => {
+        const [requestsBefore, timersBefore] = [asked.length, made()];
+        await Promise.all(clients.map(async (client, index) => await client.ingest({
+          kind: "user-prompt", sessionId: sessionIds[index]!, eventId: `${round}-${index}`, text: round,
+        })));
+        await vi.advanceTimersByTimeAsync(apart);
+        return { requests: tally(asked.slice(requestsBefore)), timers: made() - timersBefore };
+      };
+
+      const near = await fromPromptToNext("near", 1_000);
+      const far = await fromPromptToNext("far", 60_000);
+
+      // Only the prompts reached the daemon, and a minute apart cost what a second apart did.
+      expect(near.requests).toEqual({ ingest: 10 });
+      expect(far).toEqual(near);
+    } finally {
+      for (const client of clients) await client.close();
+      await server.close();
+    }
+  }, 60_000);
+
+  it("end the ask the daemon holds for a session when the connection that sent it closes", async () => {
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const root = await mkdtemp(join(tmpdir(), "rerail-native-idle-connection-"));
+    directories.push(root);
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    startTestRepository(root);
+    const daemon = await startNativeTestDaemon(root);
+    // What the daemon's route hands the server with the ask: the signal its connection ends.
+    const asked = Promise.withResolvers<AbortSignal>();
+    const handle: (this: NativeSessionServer, input: unknown, signal?: AbortSignal) => Promise<unknown> = NativeSessionServer.prototype.handle;
+    vi.spyOn(NativeSessionServer.prototype, "handle").mockImplementation(function (this: NativeSessionServer, input: unknown, signal?: AbortSignal) {
+      if (z.object({ operation: z.literal("await-deliveries") }).safeParse(input).success && signal !== undefined) asked.resolve(signal);
+      return handle.call(this, input, signal);
+    });
+    const session = { workspaceRoot: root, sessionId: "idle-connection", host: "pi" };
+    const send = (body: object, signal?: AbortSignal): Promise<Response> => fetch(new URL("/native/session", daemon.url), {
+      method: "POST",
+      // The daemon's access capability, as daemon.test.ts sends it, and the native token.
+      headers: { "content-type": "application/json", "x-rerail-access": daemon.state().accessToken!, authorization: `Bearer ${daemon.state().nativeToken!}` },
+      body: JSON.stringify({ ...session, ...body }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    expect((await send({ operation: "initialize", entries: [], input: { cwd: root, modelPath: resolve("model"), rules: [] } })).status).toBe(200);
+    // A poll takes what the new session owes, so its next ask is held.
+    expect((await send({ operation: "poll" })).status).toBe(200);
+    const connection = new AbortController();
+    const asking = send({ operation: "await-deliveries" }, connection.signal);
+    const held = await asked.promise;
+    expect(held.aborted).toBe(false);
+
+    connection.abort();
+    await expect(asking).rejects.toThrow();
+
+    await new Promise<void>(resolve => {
+      if (held.aborted) resolve();
+      else held.addEventListener("abort", () => resolve(), { once: true });
+    });
+    expect(held.aborted).toBe(true);
+  }, 30_000);
 });

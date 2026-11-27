@@ -18,6 +18,7 @@ import { MATCH_ENTRY_TYPE, MUTATION_ENTRY_TYPE, replaySessionState, TURN_ENTRY_T
 import { RerailRuntime } from "../runtime/runtime.js";
 import type { MergeAssistRuntime } from "../runtime/merge-assist/service.js";
 import { resolveSessionPaths } from "../runtime/session-paths.js";
+import { DeliveryWait } from "./delivery-wait.js";
 
 export type NativeSessionRequest = z.infer<typeof requestSchema>;
 
@@ -28,6 +29,8 @@ export interface NativeSessionResponse {
   entries: Array<{ customType: string; data: unknown }>;
   /** The operation is still running: its reply is collected with `await-reply` and this ticket; this answer carries nothing. */
   pendingReply?: string;
+  /** On a poll's answer: this daemon holds an `await-deliveries` until the session has deliveries, so its client asks with that next. */
+  waitForDeliveries?: true;
 }
 const NATIVE_SESSION_LEASE_MS = 60_000;
 const NATIVE_SESSION_SWEEP_INTERVAL_MS = 5_000;
@@ -61,6 +64,7 @@ interface NativeSession {
   pendingDeliveries: AdapterDelivery[];
   appendEntries: Array<{ customType: string; data: unknown }>;
   leaseExpiresAt: number;
+  deliveryWait: DeliveryWait;
 }
 
 type SessionEntry = OmpSessionEntryLike;
@@ -71,7 +75,7 @@ const requestSchema = objectSchema.extend({
   workspaceRoot: z.string(),
   sessionId: z.string().min(1),
   host: z.union([z.literal("omp"), z.literal("pi")]),
-  operation: z.enum(["initialize", "ingest", "cosine", "semantic", "poll", "yield", "close", "record-steering-delivery", "record-gap", "await-reply", "await-code-rules"]),
+  operation: z.enum(["initialize", "ingest", "cosine", "semantic", "poll", "yield", "close", "record-steering-delivery", "record-gap", "await-reply", "await-code-rules", "await-deliveries"]),
   entries: z.unknown().optional(),
   entriesEncoding: z.literal("superjson").optional(),
   event: z.unknown().optional(),
@@ -159,8 +163,11 @@ export class NativeSessionServer {
   readonly #sessionLeaseMs: number;
   readonly #sessions = new Map<string, NativeSession>();
   readonly #lanes = new SessionLanes();
-  readonly #sweepTimer: NodeJS.Timeout;
+  readonly #sweepIntervalMs: number;
+  /** Armed only while some open session can run out of lease: one with no ask held (`#armSweep`). */
+  #sweepTimer: NodeJS.Timeout | undefined;
   #sweepTask: Promise<void> | undefined;
+  #closed = false;
   /** Disposals of closed sessions still waiting for an evaluator that was opening; the server's own close waits for them. */
   readonly #disposals = new Set<Promise<void>>();
   readonly #replyWithinMs: number;
@@ -185,31 +192,20 @@ export class NativeSessionServer {
     this.#sessionLeaseMs = options.sessionLeaseMs ?? NATIVE_SESSION_LEASE_MS;
     this.#replyWithinMs = options.replyWithinMs ?? NATIVE_REPLY_WITHIN_MS;
     if (this.#replyWithinMs <= 0) throw new RangeError("native reply bound must be positive");
-    const sweepIntervalMs = options.sessionSweepIntervalMs ?? NATIVE_SESSION_SWEEP_INTERVAL_MS;
-    if (this.#sessionLeaseMs <= 0 || sweepIntervalMs <= 0) throw new RangeError("native session lease intervals must be positive");
-    this.#sweepTimer = setInterval(() => {
-      if (this.#sweepTask !== undefined) return;
-      this.#sweepTask = this.#sweepExpired().finally(() => {
-        this.#sweepTask = undefined;
-      });
-    }, sweepIntervalMs);
-    this.#sweepTimer.unref();
+    this.#sweepIntervalMs = options.sessionSweepIntervalMs ?? NATIVE_SESSION_SWEEP_INTERVAL_MS;
+    if (this.#sessionLeaseMs <= 0 || this.#sweepIntervalMs <= 0) throw new RangeError("native session lease intervals must be positive");
   }
 
-  async handle(input: unknown): Promise<unknown> {
+  /** `signal` ends with the request's connection: an `await-deliveries` whose client went away stops holding its session. */
+  async handle(input: unknown, signal?: AbortSignal): Promise<unknown> {
     const parsed = requestSchema.parse(input);
     if (resolve(parsed.workspaceRoot) !== this.#workspaceRoot) throw new RangeError("native workspace mismatch");
     // Outside the session's lane: the lane is what the operation being awaited holds.
     if (parsed.operation === "await-reply") return this.#awaitReply(parsed.sessionId, awaitReplyInputSchema.parse(parsed.input).ticket);
+    // Also outside it, and outside the deferred replies: it holds nothing, and waits as long as nothing happens.
+    if (parsed.operation === "await-deliveries") return this.#awaitDeliveries(parsed, signal);
     // Also outside it: the session's events go on while its evaluator opens, and only the host's gate waits for it.
-    const work = parsed.operation === "await-code-rules" ? this.#codeRulesOpened(parsed.sessionId) : this.#lanes.run(parsed.sessionId, async () => {
-      const response = await this.#handle(parsed);
-      if (parsed.operation !== "close") {
-        const active = this.#sessions.get(parsed.sessionId);
-        if (active !== undefined) active.leaseExpiresAt = Date.now() + this.#sessionLeaseMs;
-      }
-      return response;
-    });
+    const work = parsed.operation === "await-code-rules" ? this.#codeRulesOpened(parsed.sessionId) : this.#lanes.run(parsed.sessionId, async () => await this.#inLane(parsed));
     if (parsed.deferReply !== true) return work;
     // Answered at once when it finishes within the bound; otherwise it keeps the session's lane, so what the client
     // sends next queues behind it, in order, while the client collects this reply with the ticket.
@@ -227,12 +223,61 @@ export class NativeSessionServer {
     return this.#awaitReply(parsed.sessionId, ticket);
   }
 
+  /**
+   * An operation of the session, in its lane; any but its close renews its lease. A poll takes what the session has, so
+   * an ask after it waits for what comes next, and its answer says this daemon holds such an ask.
+   */
+  async #inLane(parsed: NativeSessionRequest): Promise<NativeSessionResponse> {
+    if (parsed.operation === "poll") this.#sessions.get(parsed.sessionId)?.deliveryWait.taking();
+    const response = await this.#handle(parsed);
+    if (parsed.operation !== "close") {
+      const active = this.#sessions.get(parsed.sessionId);
+      if (active !== undefined) active.leaseExpiresAt = Date.now() + this.#sessionLeaseMs;
+    }
+    return parsed.operation === "poll" ? { ...response, waitForDeliveries: true } : response;
+  }
+
   /** Answers once the session's code-rule evaluator has opened (or failed to): the repository is indexed. */
   async #codeRulesOpened(sessionId: string): Promise<NativeSessionResponse> {
     const session = this.#sessions.get(sessionId);
     if (session === undefined) throw new Error("native session is not initialized");
     await session.runtime.codeRulesOpened(sessionId);
     return { deliveries: [], entries: [] };
+  }
+
+  /**
+   * Answers, carrying nothing, once the session has deliveries for a poll to take (`DeliveryWait`), closes, or the server
+   * does; the client going away (`signal`) ends it too. Its lease holds while it waits, and runs again from its end.
+   */
+  async #awaitDeliveries(input: NativeSessionRequest, signal: AbortSignal | undefined): Promise<NativeSessionResponse> {
+    const session = this.#sessionForRequest(input);
+    if (session === undefined) throw new Error("native session is not initialized");
+    try {
+      await session.deliveryWait.until(signal);
+    } finally {
+      session.leaseExpiresAt = Date.now() + this.#sessionLeaseMs;
+      this.#armSweep();
+    }
+    return { deliveries: [], entries: [] };
+  }
+
+  /** Arms the sweep of expired leases, unless it is armed or the server closed; the sweep disarms itself (`#sweep`). */
+  #armSweep(): void {
+    if (this.#sweepTimer !== undefined || this.#closed) return;
+    this.#sweepTimer = setInterval(() => this.#sweep(), this.#sweepIntervalMs);
+    this.#sweepTimer.unref();
+  }
+
+  /** One tick: with no open session that can run out of lease (none, or each holding an ask), the timer stops. */
+  #sweep(): void {
+    if (![...this.#sessions.values()].some(session => !session.deliveryWait.held)) {
+      clearInterval(this.#sweepTimer);
+      this.#sweepTimer = undefined;
+      return;
+    }
+    this.#sweepTask ??= this.#sweepExpired().finally(() => {
+      this.#sweepTask = undefined;
+    });
   }
 
   /** The deferred operation's reply once it is done, or its ticket again, carrying nothing, after another `#replyWithinMs`. */
@@ -251,7 +296,9 @@ export class NativeSessionServer {
   }
 
   async close(): Promise<void> {
+    this.#closed = true;
     clearInterval(this.#sweepTimer);
+    this.#sweepTimer = undefined;
     for (const deferred of this.#deferred.values()) clearTimeout(deferred.expiry);
     this.#deferred.clear();
     await this.#sweepTask;
@@ -391,8 +438,9 @@ export class NativeSessionServer {
         timingLog: line => process.stderr.write(line),
         beforeSessionPublish: () => this.#replace(existing, attached),
         // No deliverBackground: a result completing during an event rides that event's reply, so the
-        // host sees it before its next model call; other results are drained by `poll`, and the findings that missed
-        // their step by `yield` at the end of the run.
+        // host sees it before its next model call; other results are drained by `poll`, which the session's held
+        // `await-deliveries` asks for as they come, and the findings that missed their step by `yield` at the end of the run.
+        deliveriesWaiting: () => attached.deliveryWait.wake(),
         nativeSession: {
           registry, ruleSync, turn,
           onMatch: (match, sample, matchedTurn) => attached.appendEntries.push({ customType: MATCH_ENTRY_TYPE, data: matchEntry(registry, match, sample, matchedTurn) }),
@@ -402,6 +450,7 @@ export class NativeSessionServer {
       const attached: NativeSession = {
         session, registry, ruleSync, runtime, semantic, entries: branch, turn,
         pendingDeliveries: [], appendEntries: [], leaseExpiresAt: Date.now() + this.#sessionLeaseMs,
+        deliveryWait: new DeliveryWait(),
       };
       semantic.initialize({
         sessionId: session.sessionId,
@@ -413,6 +462,7 @@ export class NativeSessionServer {
       // the session this one replaces: close it here, or its runtime, handles and timers outlive the map entry.
       if (this.#sessions.has(input.sessionId)) await this.#close(input.sessionId);
       this.#sessions.set(input.sessionId, attached);
+      this.#armSweep();
       return this.#reply(attached);
     } catch (error) {
       await discardSession(runtime, semantic, ruleSync);
@@ -514,12 +564,12 @@ export class NativeSessionServer {
 
   async #sweepExpired(): Promise<void> {
     const expired = [...this.#sessions]
-      .filter(([, session]) => session.leaseExpiresAt <= Date.now())
+      .filter(([, session]) => leaseRanOut(session))
       .map(([sessionId]) => sessionId);
     const results = await Promise.allSettled(expired.map(async sessionId =>
       this.#lanes.run(sessionId, async () => {
         const session = this.#sessions.get(sessionId);
-        if (session !== undefined && session.leaseExpiresAt <= Date.now()) await this.#close(sessionId);
+        if (session !== undefined && leaseRanOut(session)) await this.#close(sessionId);
       })));
     for (const result of results) {
       if (result.status === "rejected") {
@@ -532,6 +582,8 @@ export class NativeSessionServer {
     const session = this.#sessions.get(sessionId);
     if (session === undefined) return;
     this.#sessions.delete(sessionId);
+    // Its held asks are answered: the client's poll after them finds the session gone, or the one that replaced it.
+    session.deliveryWait.wake();
     try {
       await session.runtime.ingest({ kind: "session-end", eventId: `session-end:${sessionId}:${randomUUID()}`, sessionId, session: session.session });
     } finally {
@@ -558,6 +610,11 @@ export class NativeSessionServer {
       session.ruleSync.close();
     }
   }
+}
+
+/** A session whose client is gone: no request of it for a whole lease, and no ask of it held (its client still connected). */
+function leaseRanOut(session: NativeSession): boolean {
+  return !session.deliveryWait.held && session.leaseExpiresAt <= Date.now();
 }
 
 function matchEntry(registry: ConversationRuleRegistry, match: RuleMatch, sample: AdapterSample, turn: number): unknown {

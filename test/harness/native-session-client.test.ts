@@ -1126,6 +1126,151 @@ describe("daemon native client polling resilience", () => {
   });
 });
 
+describe("an idle native session", () => {
+  it("brings a steer whose check finishes after its tool result was answered to a session that sends nothing more", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "rerail-native-idle-steer-")));
+    directories.push(root);
+    vi.stubEnv("RERAIL_HOME", join(root, "home"));
+    setUpTestRepository(root, { library: [{
+      kind: "code",
+      rule: codeRuleSchema.parse({
+        format: "rerail.policy/v1", id: "test:needle", revision: 1, mode: "steer",
+        scope: { include: ["**/*.py"], exclude: [] },
+        clauses: [{ id: "needle", violation: { code: "NEEDLE", anchor: "witness.span", message: "No needle" }, forbid: { regex: { pattern: "NEEDLE", source: "file.content" } } }],
+      }),
+    }] });
+    const daemon = await startNativeTestDaemon(root);
+    // The edit is checked only once the test releases it, after its tool result has been answered.
+    const release = Promise.withResolvers<void>();
+    const finish = CodeRuleBridge.prototype.finish;
+    vi.spyOn(CodeRuleBridge.prototype, "finish").mockImplementationOnce(function (this: CodeRuleBridge, toolCallId: string, failed?: boolean) {
+      void release.promise.then(async () => {
+        await finish.call(this, toolCallId, failed);
+        await this.settleGeneratedEdits();
+      });
+      return Promise.resolve([]);
+    });
+    const asked: string[] = [];
+    // The first poll after activation takes what the new session owes, so the ask after it waits on the daemon.
+    const heldAsk = Promise.withResolvers<void>();
+    const network = globalThis.fetch;
+    vi.stubGlobal("fetch", async (url: URL, init: RequestInit) => {
+      const { operation } = readBody(init);
+      asked.push(operation);
+      if (operation === "await-deliveries") heldAsk.resolve();
+      return network(url, init);
+    });
+    const steered = Promise.withResolvers<AdapterDelivery>();
+    const client = new NativeSessionClient({
+      instance: { workspaceRoot: root, url: new URL(daemon.url), accessToken: daemon.state().accessToken! },
+      token: daemon.state().nativeToken!,
+      host: "pi", sessionId: "idle-steer", entries: () => [],
+      appendEntry() {},
+      deliver: (_client, deliveries) => { if (deliveries[0] !== undefined) steered.resolve(deliveries[0]); },
+    });
+    const event = <Event extends object>(value: Event) => ({ ...value, sessionId: "idle-steer" });
+    try {
+      await client.initialize({ cwd: root, modelPath: resolve("model") });
+      await client.activate();
+      await client.awaitCodeRules();
+      await client.ingest(event({ kind: "call" as const, eventId: "call", toolCallId: "write", toolName: "write", input: { path: "edited.py" } }));
+      await writeFile(join(root, "edited.py"), "NEEDLE\n");
+      await client.ingest(event({ kind: "result" as const, eventId: "result", toolCallId: "write", toolName: "write", output: "written" }));
+      // The session sends nothing more, and its ask waits on the daemon before the check finishes.
+      await heldAsk.promise;
+      const sent = asked.length;
+      release.resolve();
+
+      await expect(steered.promise).resolves.toEqual(expect.objectContaining({ requested: "steer", ruleIds: ["test:needle"] }));
+      // No event carried it: the session's held ask came back, and one poll took it.
+      expect(asked.slice(sent).filter(operation => operation !== "await-deliveries")).toEqual(["poll"]);
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
+  it("stops the ask the daemon holds for it when it closes, and asks nothing after", async () => {
+    vi.useFakeTimers();
+    const asked: string[] = [];
+    const held = Promise.withResolvers<AbortSignal>();
+    vi.stubGlobal("fetch", async (_url: URL, init: RequestInit) => {
+      const { operation } = readBody(init);
+      asked.push(operation);
+      if (operation !== "await-deliveries") {
+        return Response.json({ deliveries: [], entries: [], ...(operation === "poll" ? { waitForDeliveries: true } : {}) });
+      }
+      const ask = Promise.withResolvers<Response>();
+      init.signal?.addEventListener("abort", () => ask.reject(new DOMException("aborted", "AbortError")), { once: true });
+      if (init.signal) held.resolve(init.signal);
+      return await ask.promise;
+    });
+    const client = new NativeSessionClient({
+      instance: { workspaceRoot: "/workspace", url: new URL("http://127.0.0.1:4737") },
+      token: "native-token",
+      host: "pi", sessionId: "closing-idle", entries: () => [],
+      appendEntry() {},
+      deliver() {},
+    });
+    await client.initialize({});
+    await client.activate();
+    await vi.advanceTimersByTimeAsync(100);
+    const signal = await held.promise;
+    expect(signal.aborted).toBe(false);
+
+    await client.close();
+
+    expect(signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(asked).toEqual(["initialize", "poll", "await-deliveries", "close"]);
+  });
+
+  it("asks once when the daemon goes away while it holds the session's ask, and waits again once the outage's probe finds it back", async () => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const asked: string[] = [];
+    let held: PromiseWithResolvers<Response> | undefined;
+    let down = false;
+    vi.stubGlobal("fetch", async (_url: URL, init: RequestInit) => {
+      const { operation } = readBody(init);
+      asked.push(operation);
+      if (down) throw new TypeError("fetch failed");
+      if (operation !== "await-deliveries") {
+        return Response.json({ deliveries: [], entries: [], ...(operation === "poll" ? { waitForDeliveries: true } : {}) });
+      }
+      const ask = Promise.withResolvers<Response>();
+      init.signal?.addEventListener("abort", () => ask.reject(new DOMException("aborted", "AbortError")), { once: true });
+      held = ask;
+      return await ask.promise;
+    });
+    const client = new NativeSessionClient({
+      instance: { workspaceRoot: "/workspace", url: new URL("http://127.0.0.1:4737") },
+      token: "native-token",
+      host: "pi", sessionId: "restarted", entries: () => [],
+      appendEntry() {},
+      deliver() {},
+    });
+    await client.initialize({});
+    await client.activate();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(asked).toEqual(["initialize", "poll", "await-deliveries"]);
+
+    // The daemon stops: the connection of the ask it held ends, and the session asks once.
+    down = true;
+    held!.reject(new TypeError("fetch failed"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(asked.slice(3)).toEqual(["poll"]);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("Rerail native runtime unavailable"));
+
+    down = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(asked.slice(3)).toEqual(["poll", "poll", "await-deliveries"]);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining("Rerail native runtime recovered"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(asked.slice(3)).toEqual(["poll", "poll", "await-deliveries"]);
+    await client.close();
+  });
+});
+
 describe("the end of a native host's run", () => {
   it("with the experimental digest on, delivers, only when the run ends, the digest of a steer whose edit was checked after the step that made it", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "rerail-native-yield-")));

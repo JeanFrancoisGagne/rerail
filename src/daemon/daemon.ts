@@ -28,7 +28,7 @@ import { startCheckoutPruning, type CheckoutPruning } from "./checkout-pruning.j
 import { startHistorySync, type HistorySync, type HistorySyncOptions } from "./history-sync.js";
 import type { RepositoryWorktreeWalks } from "../engine/code-rule/worktree-walks.js";
 import { getRequestListener } from "@hono/node-server";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { accessCapability, createRerailApi, hostAllowlist, publicHostSet, requestBodyLimit } from "../api/http.js";
 import { createRerailMcpHandler } from "../api/mcp.js";
@@ -383,6 +383,34 @@ function daemonUi(options: RerailDaemonOptions): { uiRoot: string | undefined; u
   return { uiRoot, ui: uiRoot === undefined || options.dev === true ? "dev" : "bundled" };
 }
 
+/**
+ * The answer that refuses a `/native/session` request before its body is read: browsers always send Origin, and Rerail
+ * processes always send JSON with the private capability.
+ */
+function nativeRefusal(context: Context, nativeToken: string): Response | undefined {
+  if (context.req.header("origin") !== undefined) return context.json({ error: "native-origin-forbidden" }, 403);
+  if (context.req.header("content-type") !== "application/json") return context.json({ error: "native-content-type-required" }, 415);
+  if (!sameSecret(context.req.header("authorization"), `Bearer ${nativeToken}`)) return context.json({ error: "native-authorization-invalid" }, 403);
+  return undefined;
+}
+
+/** A `/native/session` request's body when it is a JSON object addressed to `workspaceRoot`, else the answer that refuses it. */
+async function nativeBody(context: Context, workspaceRoot: string): Promise<{ body: { workspaceRoot: string } } | { refused: Response }> {
+  let body: unknown;
+  try {
+    body = await context.req.json();
+  } catch {
+    return { refused: context.json({ error: "native-request-invalid" }, 400) };
+  }
+  if (!addressedBody(body)) return { refused: context.json({ error: "native-request-invalid" }, 400) };
+  if (resolve(body.workspaceRoot) !== workspaceRoot) return { refused: context.json({ error: "native-workspace-mismatch" }, 403) };
+  return { body };
+}
+
+function addressedBody(body: unknown): body is { workspaceRoot: string } {
+  return body !== null && typeof body === "object" && !Array.isArray(body) && "workspaceRoot" in body && typeof body.workspaceRoot === "string";
+}
+
 /** What the HTTP app serves. `health` asks the daemon the app ends up behind. */
 function daemonApp({ stores, options, publicHosts, accessToken, nativeToken, sessions, workspaceRoot, uiRoot, health }: {
   stores: DatabaseApiStores; options: RerailDaemonOptions; publicHosts: ReturnType<typeof publicHostSet>; accessToken: string; nativeToken: string;
@@ -412,25 +440,13 @@ function daemonApp({ stores, options, publicHosts, accessToken, nativeToken, ses
   }
 
   app.post("/native/session", async (context) => {
-    // Browsers always send Origin, and Rerail processes always send JSON with the private capability.
-    if (context.req.header("origin") !== undefined) return context.json({ error: "native-origin-forbidden" }, 403);
-    if (context.req.header("content-type") !== "application/json") return context.json({ error: "native-content-type-required" }, 415);
-    if (!sameSecret(context.req.header("authorization"), `Bearer ${nativeToken}`)) {
-      return context.json({ error: "native-authorization-invalid" }, 403);
-    }
-    let body: unknown;
+    const refused = nativeRefusal(context, nativeToken);
+    if (refused !== undefined) return refused;
+    const read = await nativeBody(context, workspaceRoot);
+    if ("refused" in read) return read.refused;
     try {
-      body = await context.req.json();
-    } catch {
-      return context.json({ error: "native-request-invalid" }, 400);
-    }
-    if (body === null || typeof body !== "object" || Array.isArray(body)
-      || !("workspaceRoot" in body) || typeof body.workspaceRoot !== "string") {
-      return context.json({ error: "native-request-invalid" }, 400);
-    }
-    if (resolve(body.workspaceRoot) !== workspaceRoot) return context.json({ error: "native-workspace-mismatch" }, 403);
-    try {
-      return context.json(await sessions.handle(body));
+      // The request's signal ends with its connection, which is how a held `await-deliveries` learns its client went away.
+      return context.json(await sessions.handle(read.body, context.req.raw.signal));
     } catch (error) {
       return context.json({
         error: "native-request-invalid",

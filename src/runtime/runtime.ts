@@ -1322,6 +1322,11 @@ export interface RerailRuntimeOptions {
   auditSettings?: Partial<CheckoutAuditSettings>;
   /** Delivers a completed background code-rule result without waiting for another host event. */
   deliverBackground?: (delivery: AdapterDelivery) => Promise<void> | void;
+  /**
+   * Told when a session gains a steer that `collectDeliveries` would hand out (a check's steer, a Merge Assist note, the
+   * steers an evaluator that just opened lets go), so a host that collects them asks then instead of on a timer.
+   */
+  deliveriesWaiting?: (sessionId: string) => void;
   /** Transfers a prepared session's host ownership before durable publication. */
   beforeSessionPublish?: (session: AdapterSession) => Promise<void> | void;
   /** Test and alternate-runtime seam for audits. */
@@ -1435,6 +1440,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
   readonly #nativeSession: RerailRuntimeOptions["nativeSession"];
   readonly #createAuditor: NonNullable<RerailRuntimeOptions["createAuditor"]>;
   readonly #deliverBackground: RerailRuntimeOptions["deliverBackground"];
+  readonly #deliveriesWaiting: RerailRuntimeOptions["deliveriesWaiting"];
   readonly #beforeSessionPublish: RerailRuntimeOptions["beforeSessionPublish"];
   readonly #auditSettings: CheckoutAuditSettings;
   readonly #controls: SqliteAuditControlStore;
@@ -1467,6 +1473,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
     this.#modelPath = options.modelPath;
     this.#nativeSession = options.nativeSession;
     this.#deliverBackground = options.deliverBackground;
+    this.#deliveriesWaiting = options.deliveriesWaiting;
     this.#mergeAssist = options.mergeAssist;
     this.#ownsMergeAssist = options.mergeAssist === undefined;
     this.#mergeAssistWaitMs = options.mergeAssistWaitMs ?? MERGE_ASSIST_WAIT_MS;
@@ -2084,6 +2091,17 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
   }
 
   /**
+   * Tells a host that collects the session's deliveries (`deliveriesWaiting`) that its next collect has a steer to take:
+   * one it owed as it opened, or a pending one once its evaluator is open (`#collectPendingSteers`).
+   */
+  #announceDeliveries(state: RuntimeSessionState): void {
+    if (this.#deliveriesWaiting === undefined || state.closed) return;
+    if (state.owed.steers.length > 0 || (state.codeRuleReady && state.pendingSteers.length > 0)) {
+      this.#deliveriesWaiting(state.descriptor.sessionId);
+    }
+  }
+
+  /**
    * The steers the session owed its agent when it last closed, recorded as delivered, for the answer collecting them;
    * one that no longer speaks for its files is dropped (`#stillOwed`). Its held findings join the evaluator's once it is
    * open, checked the same way. The ledger's entry is written again with what is still owed. They are taken only once
@@ -2643,6 +2661,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
         return undefined;
       }
       opened.codeRuleReady = true;
+      this.#announceDeliveries(opened);
       if (this.#deliverBackground !== undefined) {
         // Delivery removes entries from the list, so iterate a snapshot.
         const pendingSteerSnapshot = [...opened.pendingSteers];
@@ -3389,7 +3408,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
     const running = this.#mergeAssistService(state);
     if (running === undefined) return;
     const { sessionId, host } = state.descriptor;
-    void running.openSession(state.checkout.root, host, sessionId).then(() => this.#queueMergeAssistNotes(state, running)).catch((error: unknown) => {
+    void running.openSession(state.checkout.root, host, sessionId).then(() => this.#queueMergeAssistNotesNow(state, running)).catch((error: unknown) => {
       process.stderr.write(`rerail: Merge Assist failed in session ${sessionId}: ${error instanceof Error ? error.message : String(error)}\n`);
     });
   }
@@ -3421,7 +3440,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
     const service = this.#mergeAssist;
     this.#mergeAssistUnlisten ??= service.onConflictsChanged(checkoutPath => {
       for (const session of this.#sessions.values()) {
-        if (session.checkout.root === checkoutPath) this.#queueMergeAssistNotes(session, service);
+        if (session.checkout.root === checkoutPath) this.#queueMergeAssistNotesNow(session, service);
       }
     });
     return service;
@@ -3440,9 +3459,9 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
     const root = state.checkout.root;
     return running.detectAfterEdit(root, state.descriptor.sessionId, state.descriptor.host).then(async ran => {
       if (!ran) return;
-      this.#queueMergeAssistNotes(state, running);
+      this.#queueMergeAssistNotesNow(state, running);
       await running.notesReleased(root);
-      this.#queueMergeAssistNotes(state, running);
+      this.#queueMergeAssistNotesNow(state, running);
     }).catch((error: unknown) => {
       process.stderr.write(`rerail: Merge Assist failed after an edit in session ${state.descriptor.sessionId}: ${error instanceof Error ? error.message : String(error)}\n`);
     });
@@ -3513,6 +3532,12 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
     }
   }
 
+  /** The session's Merge Assist notes queued outside a boundary, which a host that collects them is told of. */
+  #queueMergeAssistNotesNow(state: RuntimeSessionState, service: MergeAssistRuntime): void {
+    this.#queueMergeAssistNotes(state, service);
+    this.#announceDeliveries(state);
+  }
+
   /**
    * Whether a steer, or a held finding, still speaks for the current revision of every source it names. A steer whose
    * edit was rolled back always does: it is the agent's only word that its edit is gone.
@@ -3579,6 +3604,7 @@ export class RerailRuntime implements HostRuntimePort, RerailEventLoop {
    */
   #pendSteer(state: RuntimeSessionState, pending: PendingSteer, metadata: SteerMetadata | undefined): PlacedSteer {
     state.pendingSteers.push(pending);
+    this.#announceDeliveries(state);
     return { boundaryDelivery: this.#deliverInBackground(state, pending, metadata) };
   }
 
